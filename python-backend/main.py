@@ -1,10 +1,14 @@
 from fastapi import FastAPI
-from app.db import conn, cursor
+import logging
+from app.db import get_connection
 from app.api.signals import router as signal_router
 
 app = FastAPI(title="CapriQuant", version="2.0")
 
 app.include_router(signal_router)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @app.get("/")
@@ -28,23 +32,38 @@ def normalize_symbol(symbol: str) -> str:
 
 @app.post("/market-data")
 def market_data(data: dict):
-    symbol = normalize_symbol(data["symbol"])
-    timeframe = data["timeframe"].upper()
+    symbol = normalize_symbol(data.get("symbol", "UNKNOWN"))
+    timeframe = data.get("timeframe", "M5").upper()
 
     insert_query = """
     INSERT INTO market_data
     (symbol, timeframe, timestamp, open, high, low, close, tick_volume, spread)
     VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s)
     """
-    cursor.execute(insert_query, (
-        symbol,
-        timeframe,
-        data["open"],
-        data["high"],
-        data["low"],
-        data["close"],
-        data["volume"],
-        data.get("spread", 0)
-    ))
-    conn.commit()
-    return {"status": "stored", "normalized_symbol": symbol}
+
+    try:
+        db_conn, db_cursor = get_connection()  # from app.db (with auto-reconnect)
+        db_cursor.execute(insert_query, (
+            symbol,
+            timeframe,
+            data.get("open"),
+            data.get("high"),
+            data.get("low"),
+            data.get("close"),
+            data.get("volume"),
+            data.get("spread", 0)
+        ))
+        db_conn.commit()
+        return {"status": "stored", "normalized_symbol": symbol}
+    except Exception as e:
+        logger.error(f"DB insert failed for {symbol} {timeframe}: {e}")
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        # Still return 200 so the MT5 EA keeps running without treating this as a failure
+        return {
+            "status": "accepted_but_not_stored",
+            "normalized_symbol": symbol,
+            "warning": "Data received but could not be persisted to database"
+        }
