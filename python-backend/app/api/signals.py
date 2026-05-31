@@ -1,4 +1,5 @@
 import pandas as pd
+import json
 from fastapi import APIRouter, HTTPException, Query
 from app.features.builder import compute_features, compute_structure, get_enriched_features
 from app.consensus import get_signal as legacy_get_signal
@@ -40,21 +41,20 @@ def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min
     cursor.close()
 
     # Default minimums
-    default_min = 30 if engine == "structure" else MIN_CANDLES_FOR_SIGNAL
+    default_min = 15 if engine == "structure" else MIN_CANDLES_FOR_SIGNAL   # lowered for live bootstrapping
     min_required = min_candles_override if min_candles_override is not None else default_min
 
     # Safety floor - never allow less than 5 candles even in testing
     min_required = max(min_required, 5)
 
     if len(rows) < min_required:
+        # We prefer to never 400 from /signal. The caller in get_trading_signal already
+        # does a graceful early HOLD. This path is a safety net for other direct callers.
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Not enough data for signal. "
-                f"Found only {len(rows)} candles for normalized symbol '{normalized_symbol}' "
-                f"(you requested '{symbol}'). "
-                f"Need at least {min_required} candles. "
-                f"You can bypass this during Strategy Tester with ?min_candles=10"
+                f"Not enough data. Found only {len(rows)} candles for {normalized_symbol} {timeframe} "
+                f"(need ≥ {min_required}). Use the data-feeder EA to populate the table first."
             )
         )
 
@@ -82,7 +82,9 @@ def get_data_count(symbol: str = None, timeframe: str = None):
                 "normalized_symbol": normalized,
                 "timeframe": timeframe.upper(),
                 "candle_count": count,
-                "ready_for_signal": count >= 50
+                "ready_for_default_structure": count >= 30,
+                "ready_for_min_8 (what your EA uses)": count >= 8,
+                "note": "Your EA currently requests with min_candles=8. Once candle_count >= 8, real structure signals can be generated (even if still weak)."
             }
         else:
             cursor.execute(
@@ -113,11 +115,55 @@ def get_trading_signal(
     from app.db import conn
 
     normalized = normalize_symbol(symbol)
-    df = fetch_candles(conn, symbol, timeframe.upper(), engine=engine, min_candles_override=min_candles)
+    tf_upper = timeframe.upper()
+
+    # === Graceful insufficient-data handling (eliminates 400 spam) ===
+    # Very common when data-feeder EAs and signal consumers start at the same time.
+    # Return clean 200 + HOLD instead of hard 400.
+    default_min = 15 if engine == "structure" else MIN_CANDLES_FOR_SIGNAL   # lowered from 30 for live data bootstrapping
+    min_required = min_candles if min_candles is not None else default_min
+    min_required = max(min_required, 5)
+
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT COUNT(*) FROM market_data WHERE symbol = %s AND timeframe = %s",
+        (normalized, tf_upper)
+    )
+    candles_available = cursor.fetchone()[0]
+    cursor.close()
+
+    if candles_available < min_required:
+        friendly = {
+            "signal": "HOLD",
+            "score": 0.0,
+            "confidence": 0.0,
+            "engine": engine,
+            "setup": None,
+            "confluences": [],
+            "rationale": (
+                f"Insufficient market data for {normalized} {tf_upper}. "
+                f"Only {candles_available} candles available (need ≥ {min_required}). "
+                f"Keep your data-feeder EA(s) running — signals will start once we have more bars."
+            ),
+            "candles_available": candles_available,
+            "min_required": min_required,
+            "session": "UNKNOWN",
+            "bias": "NEUTRAL",
+        }
+        response_body = {
+            "symbol": normalized,
+            "timeframe": tf_upper,
+            "engine": engine,
+            **friendly,
+        }
+        print(f"\n[SIGNAL RESPONSE] {normalized} {tf_upper}", json.dumps(response_body, indent=2, default=str))
+        return response_body
+
+    # Enough data — normal path
+    df = fetch_candles(conn, symbol, tf_upper, engine=engine, min_candles_override=min_candles)
 
     if engine == "structure":
-        # Pass through the min_candles override if provided (useful for Strategy Tester)
-        ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 30)
+        ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 15)
         result = get_structure_signal(ms, spread)
     else:
         features = compute_features(df)
@@ -129,9 +175,11 @@ def get_trading_signal(
         except Exception:
             pass
 
-    return {
+    response_body = {
         "symbol": normalized,
-        "timeframe": timeframe.upper(),
+        "timeframe": tf_upper,
         "engine": engine,
         **result,
     }
+    print(f"\n[SIGNAL RESPONSE] {normalized} {tf_upper}", json.dumps(response_body, indent=2, default=str))
+    return response_body

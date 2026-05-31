@@ -195,8 +195,8 @@ def detect_displacement(df: pd.DataFrame, atr: pd.Series, min_mult: float = 1.7)
 
 def find_swings(
     df: pd.DataFrame,
-    left: int = 5,
-    right: int = 5,
+    left: int = 3,   # Lowered from 5 for faster structure detection during live data accumulation
+    right: int = 3,  # Lowered from 5 for faster structure detection during live data accumulation
     min_strength: float = 0.4,
     atr_period: int = 14,
 ) -> List[Swing]:
@@ -205,6 +205,8 @@ def find_swings(
 
     A swing high requires the bar to be strictly higher than `left` bars before
     and `right` bars after. Same logic inverted for lows.
+
+    Defaults lowered to 3/3 to allow swing detection earlier while data feeders are still accumulating history.
 
     Strength is a combination of:
     - Confirmation width (more bars = stronger)
@@ -723,9 +725,10 @@ def compute_market_structure(
     df: pd.DataFrame,
     symbol: str = "UNKNOWN",
     timeframe: str = "M5",
-    swing_left: int = 5,
-    swing_right: int = 5,
-    min_candles: int = 30,   # Lower this during Strategy Tester / historical testing
+    swing_left: int = 3,   # Lowered for live data feeder bootstrapping (needs fewer bars to detect swings)
+    swing_right: int = 3,  # Lowered for live data feeder bootstrapping (needs fewer bars to detect swings)
+    min_candles: int = 15,   # Lowered for live data feeder bootstrapping
+    # swing_left/right defaulted to 3 (instead of 5) for earlier detection with limited bars
 ) -> MarketStructure:
     """
     Primary function to call from signals / strategies.
