@@ -159,11 +159,25 @@ def get_trading_signal(
         print(f"\n[SIGNAL RESPONSE] {normalized} {tf_upper}", json.dumps(response_body, indent=2, default=str))
         return response_body
 
-    # Enough data — normal path
-    df = fetch_candles(conn, symbol, tf_upper, engine=engine, min_candles_override=min_candles)
+    # Prefer live buffer heavily for real-time decisions
+    from app.live_data import get_recent_df, get_latest_price
+    live_df = get_recent_df(normalized, min_bars=12)  # Lower threshold for live path
+
+    if live_df is not None and len(live_df) >= 8:
+        df = live_df
+        # Use the absolute latest price
+        live_price = get_latest_price(normalized)
+        if live_price:
+            df.loc[df.index[-1], 'close'] = live_price['close']
+            if 'high' in df.columns:
+                df.loc[df.index[-1], 'high'] = max(df.loc[df.index[-1], 'high'], live_price['close'])
+            if 'low' in df.columns:
+                df.loc[df.index[-1], 'low'] = min(df.loc[df.index[-1], 'low'], live_price['close'])
+    else:
+        df = fetch_candles(conn, symbol, tf_upper, engine=engine, min_candles_override=min_candles)
 
     if engine == "structure":
-        ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 15)
+        ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 12)
         result = get_structure_signal(ms, spread)
     else:
         features = compute_features(df)
@@ -181,5 +195,18 @@ def get_trading_signal(
         "engine": engine,
         **result,
     }
+
+    # === Force live price into the response for real-time feel ===
+    try:
+        from app.live_data import get_latest_price
+        live = get_latest_price(normalized)
+        if live:
+            response_body["current_price"] = live["close"]
+            # Also update inside market_structure if present
+            if "market_structure" in response_body:
+                response_body["market_structure"]["current_price"] = live["close"]
+    except Exception:
+        pass
+
     print(f"\n[SIGNAL RESPONSE] {normalized} {tf_upper}", json.dumps(response_body, indent=2, default=str))
     return response_body
