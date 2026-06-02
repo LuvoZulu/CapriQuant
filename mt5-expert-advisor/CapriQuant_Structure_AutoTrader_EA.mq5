@@ -237,6 +237,7 @@ void ProcessSignalResponse(string json)
    {
       tradesToday++;
       Print("[CapriQuant] *** TRADE EXECUTED *** ", signalDir, " | Lots: ", lots, " | Confidence: ", confidence, "%");
+      SendTradeReport(signalDir, lots, stop, tp1, tp2, setup);
    }
 }
 
@@ -365,4 +366,27 @@ double ExtractJsonDouble(string json, string key)
    StringReplace(v, "]", "");
    return StringToDouble(v);
 }
+
+//+------------------------------------------------------------------+
+//| Report executed trade to backend for UI / historical tracking    |
+//+------------------------------------------------------------------+
+void SendTradeReport(string direction, double lots, double sl, double tp1, double tp2, string setup)
+{
+   double entry = (direction == "BUY") ? SymbolInfoDouble(currentSymbol, SYMBOL_ASK) :
+                                          SymbolInfoDouble(currentSymbol, SYMBOL_BID);
+
+   string payload = StringFormat(
+      "{\"symbol\":\"%s\",\"direction\":\"%s\",\"entry_price\":%.5f,\"stop_loss\":%.5f,"
+      "\"tp1\":%.5f,\"tp2\":%.5f,\"volume_lots\":%.2f,\"outcome\":\"open\",\"notes\":\"CapriQuant-%s\"}",
+      currentSymbol, direction, entry, sl, tp1, tp2, lots, setup);
+
+   string headers = "Content-Type: application/json\r\n";
+   uchar post_data[];
+   StringToCharArray(payload, post_data, 0, StringLen(payload));
+   uchar result_data[];
+   string response_headers;
+
+   WebRequest("POST", ServerURL + "/report-trade", headers, 5000, post_data, result_data, response_headers);
+}
+
 //+------------------------------------------------------------------+
