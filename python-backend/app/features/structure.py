@@ -830,3 +830,51 @@ def market_structure_to_legacy_features(ms: MarketStructure, df: pd.DataFrame) -
         "rsi": 50.0,
         "macd_hist": 0.0,
     }
+
+
+# =============================================================================
+# HUMAN READABLE PROGRESS / STATUS SUMMARY (used by realtime responses + UI)
+# =============================================================================
+
+def generate_structure_summary(ms: MarketStructure) -> str:
+    """
+    Produces the compact one-line status string shown in logs and the future UI, e.g.:
+    "BULLISH bias | 19 swing(s) | 0 active bullish OB(s), 1 active bearish OB(s) | no unfilled FVGs | NY_OPEN session | Recent: CHOCH BULL at 50973.0, BOS BEAR at 51170.0"
+    """
+    try:
+        bias = getattr(ms, "bias", "NEUTRAL")
+        swings = len(getattr(ms, "swings", []))
+        obs = getattr(ms, "order_blocks", []) or []
+        active_bull = sum(1 for o in obs if getattr(o, "ob_type", "") == "BULLISH" and not getattr(o, "is_mitigated", True))
+        active_bear = sum(1 for o in obs if getattr(o, "ob_type", "") == "BEARISH" and not getattr(o, "is_mitigated", True))
+
+        fvgs = getattr(ms, "fvgs", []) or []
+        unfilled_bull_fvgs = sum(1 for f in fvgs if getattr(f, "fvg_type", "") == "BULLISH" and not getattr(f, "is_filled", True))
+        unfilled_bear_fvgs = sum(1 for f in fvgs if getattr(f, "fvg_type", "") == "BEARISH" and not getattr(f, "is_filled", True))
+
+        liq_count = len(getattr(ms, "liquidity_levels", []) or [])
+
+        session_obj = getattr(ms, "session", None)
+        session = getattr(session_obj, "phase", "UNKNOWN") if session_obj else "UNKNOWN"
+        manip = getattr(session_obj, "manipulation_detected", False) if session_obj else False
+
+        recent_breaks = (getattr(ms, "breaks", []) or [])[-3:]
+        recent_parts = []
+        for b in recent_breaks:
+            btype = getattr(b, "break_type", "BREAK")
+            bdir = getattr(b, "direction", "?")
+            bprice = round(getattr(b, "broken_price", getattr(b, "price", 0.0)), 2)
+            recent_parts.append(f"{btype} {bdir} at {bprice}")
+
+        recent_str = ", ".join(recent_parts) if recent_parts else "none"
+
+        fvg_str = "no unfilled FVGs" if (unfilled_bull_fvgs + unfilled_bear_fvgs == 0) else f"{unfilled_bull_fvgs} bull / {unfilled_bear_fvgs} bear unfilled FVGs"
+        manip_str = " | manipulation" if manip else ""
+
+        return (
+            f"{bias} bias | {swings} swing(s) | "
+            f"{active_bull} active bullish OB(s), {active_bear} active bearish OB(s) | "
+            f"{fvg_str} | {session} session{manip_str} | Recent: {recent_str}"
+        ).strip()
+    except Exception:
+        return f"{getattr(ms, 'bias', 'NEUTRAL')} bias | limited data"
