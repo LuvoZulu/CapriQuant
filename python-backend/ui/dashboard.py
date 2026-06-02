@@ -130,15 +130,16 @@ sig_limit = st.slider("Signals to load", 20, 300, 80, step=10)
 signals_df = fetch_recent_signals(None if sig_symbol == "All" else sig_symbol, sig_limit)
 if not signals_df.empty:
     # Nice display columns
-    disp = signals_df[["ts", "symbol", "timeframe", "signal", "score", "confidence", "setup", "structure_summary", "bias", "current_price"]].copy()
+    disp = signals_df[["ts", "symbol", "timeframe", "signal", "score", "confidence", "setup", "structure_summary", "bias", "current_price", "total_confluence"]].copy()
     disp["ts"] = pd.to_datetime(disp["ts"])
     st.dataframe(disp, use_container_width=True, height=280)
 
-    # Simple progress chart: score over time (color by signal)
-    if "score" in disp.columns and len(disp) > 3:
-        chart_df = disp[["ts", "score", "symbol", "signal"]].set_index("ts")
-        st.line_chart(chart_df[["score"]], height=200)
-        st.caption("Signal score over time (positive = bullish conviction in the response)")
+    # Better progress chart: total_confluence over time (shows buildup even on HOLDs)
+    # The signal "score" only goes non-zero when a full setup triggers.
+    if "total_confluence" in disp.columns and len(disp) > 3:
+        chart_df = disp[["ts", "total_confluence", "symbol", "signal"]].set_index("ts")
+        st.line_chart(chart_df[["total_confluence"]], height=200)
+        st.caption("Total confluence score over time (shows buildup of AMD + FIB + PA + LIQ even before a full setup triggers a non-HOLD signal. Threshold for setups is ~0.48)")
 else:
     st.info("No signals logged yet. Run the EA + backend for a while.")
 

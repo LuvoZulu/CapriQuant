@@ -182,7 +182,7 @@ def api_recent_signals(symbol: str = None, limit: int = 100):
     try:
         q = """
             SELECT ts, symbol, timeframe, signal, score, confidence, setup, rationale,
-                   structure_summary, bias, current_price, buffer_bars
+                   structure_summary, bias, current_price, buffer_bars, raw_response
             FROM live_signals
             WHERE (%s IS NULL OR symbol = %s)
             ORDER BY ts DESC
@@ -191,7 +191,17 @@ def api_recent_signals(symbol: str = None, limit: int = 100):
         cursor.execute(q, (symbol, symbol, limit))
         rows = cursor.fetchall()
         cols = [desc[0] for desc in cursor.description]
-        return [dict(zip(cols, row)) for row in rows]
+        results = []
+        for row in rows:
+            d = dict(zip(cols, row))
+            raw = d.pop('raw_response', {}) or {}
+            if isinstance(raw, dict) and 'contextual_scores' in raw:
+                d['contextual_scores'] = raw['contextual_scores']
+                d['total_confluence'] = raw.get('contextual_scores', {}).get('total', 0)
+            else:
+                d['total_confluence'] = 0
+            results.append(d)
+        return results
     except Exception as e:
         return {"error": str(e), "data": []}
 

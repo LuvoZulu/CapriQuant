@@ -364,6 +364,14 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
 
     summary = generate_structure_summary(ms)
 
+    # Always compute contextual scores so the UI/dashboard can show
+    # the buildup of confluence even when no signal is triggered yet.
+    amd_score = amd.analyze_amd_structure(ms)
+    fib_score = fibonacci.analyze_fib_confluence(ms)
+    pa_score = price_action.analyze_price_action_contextual(ms)
+    liq_score = liquidity.analyze_liquidity_sweeps(ms)
+    total_confluence = amd_score + fib_score + pa_score + liq_score
+
     if not setups:
         return {
             "signal": "HOLD",
@@ -377,20 +385,19 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
             "session": ms.session.phase,
             "bias": ms.bias,
             "market_structure": ms.to_dict(),
+            "contextual_scores": {
+                "amd": round(amd_score, 3),
+                "fib_confluence": round(fib_score, 3),
+                "price_action": round(pa_score, 3),
+                "liquidity": round(liq_score, 3),
+                "total": round(total_confluence, 3),
+            },
         }
 
     best = setups[0]
 
     # Map internal score to the old -1..1 range for partial compatibility
     mapped_score = best.score * (1.0 if best.direction == "BUY" else -1.0)
-
-    # Recompute the contextual scores here (they live only inside evaluate_setups).
-    # This prevents the NameError on amd_score / fib_score / pa_score / liq_score.
-    amd_score = amd.analyze_amd_structure(ms)
-    fib_score = fibonacci.analyze_fib_confluence(ms)
-    pa_score = price_action.analyze_price_action_contextual(ms)
-    liq_score = liquidity.analyze_liquidity_sweeps(ms)
-    total_confluence = amd_score + fib_score + pa_score + liq_score
 
     result = {
         "signal": best.direction,
