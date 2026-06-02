@@ -106,7 +106,8 @@ for i, sym in enumerate(SYMBOLS):
         if "error" in snap or snap.get("status") == "insufficient_live_data":
             st.warning(snap.get("status", "No live data yet"))
             buf = snap.get("buffer", {})
-            st.caption(f"Buffer: {buf.get('bars_in_buffer', 0)}/{buf.get('max_bars', 10080)}")
+            bcount = buf.get('effective_bars', buf.get('bars_in_buffer', 0))
+            st.caption(f"Buffer: {bcount}/{buf.get('max_bars', 10080)} (incl. current minute)")
         else:
             st.success(snap.get("bias", "?"))
             st.write(snap.get("structure_summary", "—"))
@@ -116,8 +117,9 @@ for i, sym in enumerate(SYMBOLS):
             m3.metric("Swings", snap.get("swing_count", 0))
             st.caption(f"Price: {snap.get('current_price')}")
             buf = snap.get("buffer", {})
+            bcount = buf.get('effective_bars', buf.get('bars_in_buffer', 0))
             st.progress(min(buf.get("pct_full", 0) / 100, 1.0))
-            st.caption(f"Live buffer: {buf.get('bars_in_buffer', 0)} bars ({buf.get('pct_full', 0)}%)")
+            st.caption(f"Live buffer: {bcount} bars ({buf.get('pct_full', 0)}%) (incl. current minute)")
 
 # =============================================================================
 # SIGNAL PROGRESS / HISTORY
