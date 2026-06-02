@@ -70,7 +70,8 @@ echo   - Open http://127.0.0.1:8001 in browser
 echo   - Check services.msc for CapriQuantBackend
 echo   - Your MT5 EA should now get realtime signals on 8001
 echo.
-echo To stop:   nssm stop %SERVICE_NAME%
+echo To stop:   Double-click python-backend\service\stop_service.bat (as Admin)
+echo            or run: nssm stop %SERVICE_NAME%
 echo To remove: nssm remove %SERVICE_NAME% confirm
 echo.
 pause

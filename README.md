@@ -113,8 +113,14 @@ The goal is for the backend (FastAPI + realtime structure engine) to run automat
 
 2. **Open Command Prompt as Administrator**
 
-3. **Install the Service** (using the provided .bat wrapper):
+3. **Install the Service** (easiest: use the new installer helper as Administrator):
 
+   Double-click or run as Admin:
+   ```
+   python-backend\service\install_as_service.bat
+   ```
+
+   Or manually with the wrapper:
    ```cmd
    C:\Tools\nssm\nssm.exe install CapriQuantBackend "C:\Users\Kaos\Documents\2026\Programming\CapriQuant\python-backend\service\start_capriquant.bat"
    ```
@@ -148,6 +154,45 @@ The goal is for the backend (FastAPI + realtime structure engine) to run automat
 - Make sure the Python interpreter used by the service has all dependencies installed (`fastapi`, `uvicorn`, `psycopg2`, `pandas`, etc.).
 - You can manage the service with `nssm` commands or `services.msc`.
 - To remove the service later: `nssm remove CapriQuantBackend confirm`
+
+### How to Stop the Service
+
+To stop the running CapriQuantBackend service:
+
+**Easiest (recommended):**
+
+Double-click or run as Administrator:
+```
+python-backend\service\stop_service.bat
+```
+
+**Manual methods (as Administrator in Command Prompt):**
+
+Using NSSM (if installed at the usual location):
+```cmd
+C:\Tools\nssm\nssm.exe stop CapriQuantBackend
+```
+
+Using Windows built-in:
+```cmd
+sc stop CapriQuantBackend
+```
+
+**Using the GUI (no admin prompt needed for this step):**
+1. Press `Win + R`, type `services.msc` and press Enter.
+2. Scroll to find **CapriQuantBackend**.
+3. Right-click it → **Stop**.
+
+After stopping, the backend will no longer respond on port 8001. Your MT5 EA will stop receiving signals until you start the service again.
+
+To check status:
+```cmd
+C:\Tools\nssm\nssm.exe status CapriQuantBackend
+```
+or
+```cmd
+sc query CapriQuantBackend
+```
 
 Alternative (pure Python service without NSSM) is commented inside `run_as_windows_service.py` (requires `pip install pywin32` and registration commands).
 
