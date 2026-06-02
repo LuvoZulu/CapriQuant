@@ -1,10 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
+import logging
 import json
 from datetime import datetime
-
 from app.db import conn, cursor
 from app.api.signals import router as signal_router
-from app.live_data import live_buffer, CompletedBar
+from app.live_data import live_buffer
 from app.features.builder import compute_structure
 from app.engine.confluence import get_structure_signal
 from app.features.structure import generate_structure_summary
@@ -13,10 +13,13 @@ app = FastAPI(title="CapriQuant", version="2.1-realtime")
 
 app.include_router(signal_router)
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 @app.get("/")
 def home():
-    return {"status": "quant system live", "realtime": True, "buffer_max_m1": 10080}
+    return {"status": "quant system live"}
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -33,165 +36,120 @@ def normalize_symbol(symbol: str) -> str:
     return s
 
 
-def _persist_bar(bar: CompletedBar, spread: float = 0.0):
-    """Persist a completed M1 bar (from live aggregation) to the market_data table."""
-    try:
-        insert_query = """
-        INSERT INTO market_data
-        (symbol, timeframe, timestamp, open, high, low, close, tick_volume, spread)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT DO NOTHING
-        """
-        # Note: if your Postgres doesn't have unique constraint on (symbol, timeframe, timestamp) the ON CONFLICT is harmless or remove it.
-        cursor.execute(insert_query, (
-            bar.symbol,
-            bar.timeframe,
-            bar.timestamp,
-            bar.open,
-            bar.high,
-            bar.low,
-            bar.close,
-            bar.volume,
-            spread
-        ))
-        conn.commit()
-    except Exception:
-        # Best effort persistence; don't break the realtime path
-        conn.rollback()
-
-
 @app.post("/market-data")
-def market_data(data: dict):
+def market_data(data: dict, background_tasks: BackgroundTasks):
     """
-    Enhanced real-time ingestion point.
-
-    - Always stores the raw payload (for historical audit).
-    - For TICK payloads: aggregates into completed M1 bars using the rolling live buffer (now 10080 bars).
-    - When a new M1 bar is completed, it is persisted.
-    - Immediately runs the full structure engine on the live buffer + current price.
-    - Returns the rich signal (with structure_summary, market_structure, confluences etc.) in the response
-      so the EA gets low-latency decisions without waiting for the next M5 poll.
+    Real-time ingestion + immediate structure signal for TICK data.
+    Uses the 10080-bar rolling live buffer.
     """
-    raw_symbol = data.get("symbol", "UNKNOWN")
-    symbol = normalize_symbol(raw_symbol)
+    symbol = normalize_symbol(data.get("symbol", "UNKNOWN"))
     timeframe = str(data.get("timeframe", "TICK")).upper()
-    spread = float(data.get("spread", data.get("spread_points", 0)))
+    spread = float(data.get("spread", 0))
 
-    # 1. Always attempt to store the raw incoming payload (TICK or bar) for full audit trail
+    # Log
+    logger.info(f"[LIVE DATA] {symbol} {timeframe} | Close={data.get('close')} | Bid={data.get('bid')} | Ask={data.get('ask')} | Volume={data.get('volume')}")
+
+    # Feed the live buffer (new class API)
+    completed = live_buffer.add_market_data(symbol, data)
+
+    # Compute realtime signal on live buffer when it's TICK data
+    signal_result = None
     try:
-        insert_query = """
-        INSERT INTO market_data
-        (symbol, timeframe, timestamp, open, high, low, close, tick_volume, spread)
-        VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s)
-        """
-        cursor.execute(insert_query, (
-            symbol,
-            timeframe,
-            data.get("open", 0),
-            data.get("high", 0),
-            data.get("low", 0),
-            data.get("close", 0),
-            data.get("volume", 0),
-            spread
-        ))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-
-    # 2. Feed the live buffer (critical for real-time structure on TICKs)
-    completed_bar: CompletedBar | None = live_buffer.add_market_data(symbol, data)
-
-    if completed_bar:
-        _persist_bar(completed_bar, spread)
-
-    # 3. Real-time signal path for TICK data (matches the behavior the EA expects from the logs)
-    if timeframe == "TICK":
-        try:
-            bars_df = live_buffer.get_recent_df(symbol, limit=10080)
-            current_price = float(data.get("close") or data.get("bid") or data.get("last") or 0.0)
-
-            if len(bars_df) >= 8:
-                ms = compute_structure(
-                    bars_df,
-                    symbol=symbol,
-                    timeframe="TICK",   # live view
-                    min_candles=8
-                )
-                # Make sure the very latest tick price is reflected
+        if timeframe == "TICK":
+            df = live_buffer.get_recent_df(symbol, limit=10080)
+            current_price = float(data.get("close") or data.get("bid") or 0)
+            if df is not None and len(df) >= 8:
+                ms = compute_structure(df, symbol=symbol, timeframe="TICK", min_candles=8)
                 ms.current_price = current_price
-
-                signal = get_structure_signal(ms, spread=spread)
-
-                # Guarantee structure_summary is present (used heavily by UI and logs)
-                if "structure_summary" not in signal or not signal.get("structure_summary"):
-                    signal["structure_summary"] = generate_structure_summary(ms)
-
-                signal["current_price"] = current_price
-                signal["realtime"] = True
-                buf_status = live_buffer.get_buffer_status(symbol)
-                signal["buffer_status"] = buf_status
-
-                # Persist for UI historical + "signal building progress" charts
-                try:
-                    from app.db import persist_signal
-                    persist_signal(signal, symbol, "TICK", buffer_bars=buf_status.get("bars_in_buffer", 0))
-                except Exception:
-                    pass
-
-                print(f"\n[REALTIME SIGNAL from POST] {symbol} TICK {json.dumps(signal, indent=2, default=str)[:500]}...")
-                return signal
+                sig = get_structure_signal(ms, spread=spread)
+                # ensure nice summary
+                if not sig.get("structure_summary"):
+                    sig["structure_summary"] = generate_structure_summary(ms)
+                sig["current_price"] = current_price
+                sig["realtime"] = True
+                sig["buffer_status"] = live_buffer.get_buffer_status(symbol)
+                signal_result = sig
+                print(f"\n[REALTIME SIGNAL from POST] {symbol} TICK", json.dumps(sig, indent=2, default=str)[:600])
             else:
-                # Graceful early HOLD while the live buffer warms up (important for 24/7 restarts)
-                summary = f"Building live buffer... {len(bars_df)} / 10080 M1 bars"
-                print(f"[LIVE DATA] {symbol} TICK | Close={current_price} | buffer={len(bars_df)}")
-                return {
+                buf_status = live_buffer.get_buffer_status(symbol)
+                signal_result = {
                     "signal": "HOLD",
                     "score": 0.0,
                     "confidence": 0.0,
                     "engine": "structure_v2_strict",
                     "setup": None,
                     "confluences": [],
-                    "rationale": "Not enough live M1 bars yet for reliable structure (need >= 8).",
-                    "structure_summary": summary,
+                    "rationale": f"Not enough live M1 bars yet ({buf_status.get('bars_in_buffer', 0)}/10080).",
+                    "structure_summary": f"Building live buffer... {buf_status.get('bars_in_buffer', 0)} / 10080 M1 bars",
                     "session": "UNKNOWN",
                     "bias": "NEUTRAL",
                     "current_price": current_price,
                     "realtime": True,
-                    "buffer_status": live_buffer.get_buffer_status(symbol),
-                    "market_structure": {"symbol": symbol, "timeframe": "TICK", "current_price": current_price},
+                    "buffer_status": buf_status,
                 }
-        except Exception as e:
-            print(f"ERROR:main:Real-time structure processing failed for {symbol}: {e}")
-            # Fall through to basic stored response
+                print(f"[REALTIME SIGNAL from POST] {symbol} TICK → HOLD (building buffer)")
+    except Exception as e:
+        logger.error(f"Real-time structure processing failed for {symbol}: {e}")
 
-    # 4. Default / non-TICK response (M1/M5 bars from EA or other feeders)
-    buf_status = live_buffer.get_buffer_status(symbol)
-    print(f"INFO:main:[LIVE DATA] {symbol} {timeframe} | Close={data.get('close')} | buffer={buf_status['bars_in_buffer']}")
-    return {
-        "status": "stored",
+    # Build response
+    response = {
+        "status": "processed",
         "normalized_symbol": symbol,
         "timeframe": timeframe,
-        "realtime_buffer": buf_status,
     }
 
-
-@app.post("/report-trade")
-def report_trade(trade: dict):
-    """
-    Endpoint for the AutoTrader EA (or any executor) to report filled / managed trades.
-    Powers the 'Trades' section of the UI and historical performance tracking.
-    """
-    sym = normalize_symbol(trade.get("symbol", ""))
-    trade["symbol"] = sym
-
+    # latest price
     try:
-        persist_trade(trade)
-        return {"status": "trade_recorded", "symbol": sym}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+        latest = live_buffer.get_recent_bars(symbol)
+        if latest:
+            response["current_price"] = latest[-1].close
+    except Exception:
+        pass
+
+    if signal_result:
+        response["signal"] = signal_result
+    else:
+        response["signal"] = {
+            "signal": "HOLD",
+            "confidence": 0.0,
+            "rationale": "No realtime signal computed this tick."
+        }
+
+    # Background DB persist of the raw payload (original behavior)
+    def _persist_to_db():
+        try:
+            insert_query = """
+            INSERT INTO market_data
+            (symbol, timeframe, timestamp, open, high, low, close, tick_volume, spread)
+            VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(insert_query, (
+                symbol,
+                timeframe,
+                data.get("open", 0),
+                data.get("high", 0),
+                data.get("low", 0),
+                data.get("close", 0),
+                data.get("volume", 0),
+                data.get("spread", 0)
+            ))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Background DB insert failed for {symbol}: {e}")
+            try:
+                conn.rollback()
+            except:
+                pass
+
+    background_tasks.add_task(_persist_to_db)
+
+    return response
 
 
-# Debug endpoint for the live buffer (very useful for the UI and debugging)
+# =============================================================================
+# DEBUG + DASHBOARD API ENDPOINTS
+# =============================================================================
+
 @app.get("/debug/live-buffer")
 def debug_live_buffer(symbol: str = None):
     if symbol:
@@ -201,20 +159,12 @@ def debug_live_buffer(symbol: str = None):
             "status": live_buffer.get_buffer_status(sym),
             "recent_bars_count": len(live_buffer.get_recent_bars(sym)),
         }
-    # Aggregate view across symbols
-    all_status = {}
-    for sym in list(live_buffer.buffers.keys()):
-        all_status[sym] = live_buffer.get_buffer_status(sym)
+    all_status = {sym: live_buffer.get_buffer_status(sym) for sym in list(live_buffer.buffers.keys())}
     return {"all_symbols": all_status, "global_max_m1": live_buffer.max_bars}
 
 
-# =============================================================================
-# DASHBOARD / UI API SURFACE (used by Streamlit or any frontend)
-# =============================================================================
-
 @app.get("/api/system-status")
 def api_system_status():
-    """High level health + buffer fill for the top bar of the UI."""
     return {
         "status": "running",
         "version": "2.1-realtime",
@@ -226,7 +176,7 @@ def api_system_status():
 
 @app.get("/api/recent-signals")
 def api_recent_signals(symbol: str = None, limit: int = 100):
-    """Powers the signal history table and 'signal build-up' charts in the UI."""
+    """For the UI signal history and build-up charts."""
     from app.db import ensure_live_tables
     ensure_live_tables()
     try:
@@ -248,7 +198,7 @@ def api_recent_signals(symbol: str = None, limit: int = 100):
 
 @app.get("/api/trades")
 def api_trades(symbol: str = None, limit: int = 200):
-    """Powers the Trades section of the UI."""
+    """For the Trades section of the UI."""
     from app.db import ensure_live_tables
     ensure_live_tables()
     try:
@@ -270,25 +220,39 @@ def api_trades(symbol: str = None, limit: int = 200):
 
 @app.get("/api/current-structure/{symbol}")
 def api_current_structure(symbol: str):
-    """Quick snapshot for a symbol card in the UI (uses live buffer if available)."""
     sym = normalize_symbol(symbol)
-    buf = live_buffer.get_recent_df(sym, limit=200)
+    df = live_buffer.get_recent_df(sym, limit=200)
     status = live_buffer.get_buffer_status(sym)
-    if len(buf) < 5:
+    if df is None or len(df) < 5:
         return {"symbol": sym, "status": "insufficient_live_data", "buffer": status}
-
     try:
-        ms = compute_structure(buf, symbol=sym, timeframe="M1", min_candles=5)
+        ms = compute_structure(df, symbol=sym, timeframe="M1", min_candles=5)
         summary = generate_structure_summary(ms)
         return {
             "symbol": sym,
             "current_price": ms.current_price,
             "bias": ms.bias,
             "structure_summary": summary,
-            "active_bullish_obs": len([o for o in ms.order_blocks if o.ob_type == "BULLISH" and not o.is_mitigated]),
-            "active_bearish_obs": len([o for o in ms.order_blocks if o.ob_type == "BEARISH" and not o.is_mitigated]),
-            "swing_count": len(ms.swings),
+            "active_bullish_obs": len([o for o in ms.order_blocks if getattr(o, "ob_type", "") == "BULLISH" and not getattr(o, "is_mitigated", True)]),
+            "active_bearish_obs": len([o for o in ms.order_blocks if getattr(o, "ob_type", "") == "BEARISH" and not getattr(o, "is_mitigated", True)]),
+            "swing_count": len(getattr(ms, "swings", [])),
             "buffer": status,
         }
     except Exception as e:
         return {"symbol": sym, "error": str(e), "buffer": status}
+
+
+@app.post("/report-trade")
+def report_trade(trade: dict):
+    """
+    Endpoint for the AutoTrader EA to report filled trades.
+    Powers the Trades section of the UI.
+    """
+    sym = normalize_symbol(trade.get("symbol", ""))
+    trade["symbol"] = sym
+    try:
+        from app.db import persist_trade
+        persist_trade(trade)
+        return {"status": "trade_recorded", "symbol": sym}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}

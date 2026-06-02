@@ -10,7 +10,7 @@ Preferred way (simple & reliable):
     Or point NSSM at a small .bat:
         @echo off
         cd /d "C:\Users\Kaos\Documents\2026\Programming\CapriQuant\python-backend"
-        python -m uvicorn main:app --host 0.0.0.0 --port 8000
+        python -m uvicorn main:app --host 0.0.0.0 --port 8001
 
 The script below adds:
 - Weekday-only guard (Mon-Fri only). On weekends it sleeps or exits.
@@ -33,7 +33,9 @@ from pathlib import Path
 # =============================================================================
 BACKEND_DIR = Path(__file__).resolve().parent.parent   # python-backend/
 PYTHON_EXE = sys.executable
-UVICORN_CMD = [PYTHON_EXE, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Backend (FastAPI) listens on 0.0.0.0:8001
+# The UI (Streamlit dashboard) connects to this backend. Run the UI separately with the default Streamlit port (8501) or any other.
+UVICORN_CMD = [PYTHON_EXE, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
 
 WEEKDAY_ONLY = True          # Set False if you want 24/7 even on weekends
 WEEKEND_SLEEP_HOURS = 8      # On weekend, sleep this long between checks

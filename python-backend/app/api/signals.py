@@ -5,6 +5,7 @@ from app.features.builder import compute_features, compute_structure, get_enrich
 from app.consensus import get_signal as legacy_get_signal
 from app.engine.confluence import get_structure_signal
 from app.utils.signal_logger import log_signal
+from app.live_data import live_buffer
 
 router = APIRouter()
 
@@ -159,11 +160,30 @@ def get_trading_signal(
         print(f"\n[SIGNAL RESPONSE] {normalized} {tf_upper}", json.dumps(response_body, indent=2, default=str))
         return response_body
 
-    # Enough data — normal path
-    df = fetch_candles(conn, symbol, tf_upper, engine=engine, min_candles_override=min_candles)
+    # Strongly prefer live aggregated data for real-time structure decisions (new 10080 buffer)
+    from app.live_data import live_buffer
+    live_df = live_buffer.get_recent_df(normalized, limit=200)
+
+    if live_df is not None and len(live_df) >= 6:
+        df = live_df
+        # Force the absolute latest price into the last bar
+        try:
+            latest_bars = live_buffer.get_recent_bars(normalized)
+            if latest_bars:
+                current_close = latest_bars[-1].close
+                df.loc[df.index[-1], 'close'] = current_close
+                if 'high' in df.columns:
+                    df.loc[df.index[-1], 'high'] = max(df.loc[df.index[-1], 'high'], current_close)
+                if 'low' in df.columns:
+                    df.loc[df.index[-1], 'low'] = min(df.loc[df.index[-1], 'low'], current_close)
+        except Exception:
+            pass
+    else:
+        # Only fall back to DB if we truly have almost nothing in the live buffer
+        df = fetch_candles(conn, symbol, tf_upper, engine=engine, min_candles_override=min_candles)
 
     if engine == "structure":
-        ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 15)
+        ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 10)
         result = get_structure_signal(ms, spread)
     else:
         features = compute_features(df)
@@ -175,11 +195,11 @@ def get_trading_signal(
         except Exception:
             pass
 
-        # Persist to DB for historical UI queries and signal progress tracking
+        # Persist to DB for UI historical views and signal progress tracking
         try:
             from app.db import persist_signal
-            buf_count = 0  # For DB polls we don't have the live buffer count here; realtime path has it
-            persist_signal(result, normalized, tf_upper, buffer_bars=buf_count)
+            buf_status = live_buffer.get_buffer_status(normalized)
+            persist_signal(result, normalized, tf_upper, buffer_bars=buf_status.get("bars_in_buffer", 0))
         except Exception:
             pass
 
@@ -189,5 +209,17 @@ def get_trading_signal(
         "engine": engine,
         **result,
     }
+
+    # === Force live price into the response for real-time feel ===
+    try:
+        latest_bars = live_buffer.get_recent_bars(normalized)
+        if latest_bars:
+            current_close = latest_bars[-1].close
+            response_body["current_price"] = current_close
+            if "market_structure" in response_body:
+                response_body["market_structure"]["current_price"] = current_close
+    except Exception:
+        pass
+
     print(f"\n[SIGNAL RESPONSE] {normalized} {tf_upper}", json.dumps(response_body, indent=2, default=str))
     return response_body

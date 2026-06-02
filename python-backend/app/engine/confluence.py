@@ -23,6 +23,52 @@ from app.strategies import amd, fibonacci, price_action, liquidity
 from app.utils.signal_logger import log_signal
 
 
+def generate_structure_summary(ms: MarketStructure) -> str:
+    """
+    Creates a short human-readable summary of the current market structure.
+    This helps explain why setups are (or aren't) appearing.
+    """
+    swings = len(ms.swings)
+    active_bull = len([ob for ob in ms.order_blocks if ob.ob_type == "BULLISH" and not ob.is_mitigated])
+    active_bear = len([ob for ob in ms.order_blocks if ob.ob_type == "BEARISH" and not ob.is_mitigated])
+    unfilled_bull_fvg = len([f for f in ms.fvgs if f.fvg_type == "BULLISH" and not f.is_filled])
+    unfilled_bear_fvg = len([f for f in ms.fvgs if f.fvg_type == "BEARISH" and not f.is_filled])
+
+    recent_breaks = ms.breaks[-2:] if ms.breaks else []
+    break_descriptions = []
+    for b in recent_breaks:
+        break_descriptions.append(f"{b.break_type} {b.direction} at {round(b.broken_price, 2)}")
+
+    parts = []
+    parts.append(f"{ms.bias} bias" if ms.bias != "NEUTRAL" else "Neutral bias")
+    parts.append(f"{swings} swing(s)")
+
+    if active_bull or active_bear:
+        parts.append(f"{active_bull} active bullish OB(s), {active_bear} active bearish OB(s)")
+    else:
+        parts.append("no active Order Blocks")
+
+    fvg_parts = []
+    if unfilled_bull_fvg:
+        fvg_parts.append(f"{unfilled_bull_fvg} unfilled bullish FVG(s)")
+    if unfilled_bear_fvg:
+        fvg_parts.append(f"{unfilled_bear_fvg} unfilled bearish FVG(s)")
+    if fvg_parts:
+        parts.append(" + ".join(fvg_parts))
+    else:
+        parts.append("no unfilled FVGs")
+
+    if ms.session.phase != "UNKNOWN":
+        parts.append(f"{ms.session.phase} session")
+    else:
+        parts.append("unknown session phase")
+
+    if break_descriptions:
+        parts.append("Recent: " + ", ".join(break_descriptions))
+
+    return " | ".join(parts)
+
+
 @dataclass
 class Setup:
     name: str
@@ -316,6 +362,8 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
     """
     setups = evaluate_setups(ms, spread)
 
+    summary = generate_structure_summary(ms)
+
     if not setups:
         return {
             "signal": "HOLD",
@@ -325,6 +373,7 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
             "setup": None,
             "confluences": [],
             "rationale": "No high-quality setups after strict filters (post-backtest tuning).",
+            "structure_summary": summary,
             "session": ms.session.phase,
             "bias": ms.bias,
             "market_structure": ms.to_dict(),
@@ -335,8 +384,8 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
     # Map internal score to the old -1..1 range for partial compatibility
     mapped_score = best.score * (1.0 if best.direction == "BUY" else -1.0)
 
-    # Recompute contextual scores for the response (they are computed inside evaluate_setups
-    # but not returned; this avoids NameError and keeps evaluate_setups API stable for backtests).
+    # Recompute the contextual scores here (they live only inside evaluate_setups).
+    # This prevents the NameError on amd_score / fib_score / pa_score / liq_score.
     amd_score = amd.analyze_amd_structure(ms)
     fib_score = fibonacci.analyze_fib_confluence(ms)
     pa_score = price_action.analyze_price_action_contextual(ms)
@@ -351,6 +400,7 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
         "setup": best.name,
         "confluences": best.confluences,
         "rationale": best.rationale,
+        "structure_summary": summary,
         "entry_zone": [round(x, 5) for x in best.entry_zone],
         "stop_suggestion": round(best.stop_suggestion, 5),
         "tp1": round(best.tp1, 5),
@@ -370,7 +420,7 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
         ],
     }
 
-    # Log every signal for future analysis (critical for your aggressive goal)
+    # Log every signal for future analysis
     try:
         log_signal(result)
     except Exception:

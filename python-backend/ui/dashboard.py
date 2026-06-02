@@ -26,9 +26,14 @@ from datetime import datetime
 # =============================================================================
 # CONFIG
 # =============================================================================
-BACKEND = "http://127.0.0.1:8000"   # Change if your service listens elsewhere
+BACKEND = "http://127.0.0.1:8001"   # The FastAPI backend (service) - this is where the UI fetches data from. Backend runs on 8001.
 POLL_SECONDS = 5
 SYMBOLS = ["US30", "USTEC", "DE30", "XAUUSD"]  # extend as you add more
+
+# Run the UI (Streamlit) with:
+#   python -m streamlit run ui/dashboard.py --server.address 127.0.0.1
+# Or double-click: python-backend\ui\run_ui.bat
+# (Streamlit UI itself can run on any port - default is 8501. It fetches data from the backend on 8001)
 
 st.set_page_config(page_title="CapriQuant - Live Structure Dashboard", layout="wide")
 st.title("CapriQuant • Real-time Structure & Signal Progress")

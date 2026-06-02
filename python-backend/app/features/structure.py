@@ -195,8 +195,8 @@ def detect_displacement(df: pd.DataFrame, atr: pd.Series, min_mult: float = 1.7)
 
 def find_swings(
     df: pd.DataFrame,
-    left: int = 3,   # Lowered from 5 for faster structure detection with limited live data
-    right: int = 3,  # Lowered from 5 for faster structure detection with limited live data
+    left: int = 3,   # Lowered from 5 for faster structure detection during live data accumulation
+    right: int = 3,  # Lowered from 5 for faster structure detection during live data accumulation
     min_strength: float = 0.4,
     atr_period: int = 14,
 ) -> List[Swing]:
@@ -206,7 +206,7 @@ def find_swings(
     A swing high requires the bar to be strictly higher than `left` bars before
     and `right` bars after. Same logic inverted for lows.
 
-    Defaults lowered to 3/3 for better behavior during early live data accumulation.
+    Defaults lowered to 3/3 to allow swing detection earlier while data feeders are still accumulating history.
 
     Strength is a combination of:
     - Confirmation width (more bars = stronger)
@@ -646,26 +646,82 @@ def analyze_session_structure(
     """
     Build real session context instead of pure clock bins.
 
-    For XAUUSD + US indices the important concepts are:
-    - Asian range (low volatility, liquidity building)
-    - London open (frequent manipulation / stop hunts of Asian range)
-    - NY session (real directional moves / distribution)
+    Supports different instruments:
+    - XAUUSD / Forex: Classic Asian (22-07), London (07-11), NY (13:30-17)
+    - US Indices (US30, USTEC, etc.): Main session ~13:30-20:00 UTC
+    - European Indices (DE30, etc.): European session ~07:00-15:30 UTC
 
-    We detect actual range formation + expansion rather than assuming time == behavior.
+    Still uses dynamic range detection (actual Asian range + manipulation/expansion)
+    instead of blindly trusting the clock.
     """
     if len(df) < 20:
         return SessionRange(phase="UNKNOWN")
 
-    # Use last ~24 hours of data if possible (M5 = 288 bars, we have ~200)
     recent = df.tail(min(200, len(df))).copy()
     recent["hour"] = pd.to_datetime(recent["timestamp"]).dt.hour
 
-    # Rough proxy for sessions (UTC assumption; broker time may differ)
-    # Asian ~ 22:00-07:00, London open ~07:00-10:00, NY ~13:30-17:00
-    asian_mask = recent["hour"].between(22, 23) | recent["hour"].between(0, 6)
-    london_mask = recent["hour"].between(7, 10)
-    ny_mask = recent["hour"].between(13, 17)
+    current_price = float(recent["close"].iloc[-1])
+    current_hour = int(recent["hour"].iloc[-1])
 
+    # Determine instrument group
+    sym = symbol.upper()
+    is_us_index = any(x in sym for x in ["US30", "USTEC", "NAS", "NDX", "SPX", "DJI"])
+    is_eu_index = any(x in sym for x in ["DE30", "DAX", "GER", "EU", "ESTX"])
+
+    phase: SessionPhase = "UNKNOWN"
+    manipulation = False
+    expansion_dir = None
+
+    # --- Define hour buckets per instrument group (UTC assumption) ---
+    if is_us_index:
+        # US Indices: Overnight low-vol, then main US session
+        if 0 <= current_hour < 13:
+            phase = "ASIAN"          # Overnight / pre-market (low vol)
+        elif 13 <= current_hour < 17:
+            phase = "NY_OPEN"        # Main US open / London overlap
+        elif 17 <= current_hour < 21:
+            phase = "NY_PM"          # Late US session
+        else:
+            phase = "OFF_SESSION"
+
+        # For US indices we still compute an "Asian" range from the overnight period
+        asian_mask = recent["hour"].between(0, 12)
+        london_mask = recent["hour"].between(13, 16)   # London overlap with US open
+        ny_mask = recent["hour"].between(13, 20)
+
+    elif is_eu_index:
+        # European Indices: Main session during European hours
+        if 0 <= current_hour < 7:
+            phase = "ASIAN"          # Overnight
+        elif 7 <= current_hour < 11:
+            phase = "LONDON_OPEN"    # European open / London
+        elif 11 <= current_hour < 16:
+            phase = "NY_OPEN"        # European afternoon + NY open
+        else:
+            phase = "OFF_SESSION"
+
+        asian_mask = recent["hour"].between(0, 6)
+        london_mask = recent["hour"].between(7, 10)
+        ny_mask = recent["hour"].between(13, 17)
+
+    else:
+        # Default = Gold / Forex logic (original)
+        if 0 <= current_hour < 7 or 22 <= current_hour <= 23:
+            phase = "ASIAN"
+        elif 7 <= current_hour < 11:
+            phase = "LONDON_OPEN"
+        elif 11 <= current_hour < 13:
+            phase = "NY_OPEN"
+        elif 13 <= current_hour < 18:
+            phase = "NY_PM"
+        else:
+            phase = "OFF_SESSION"
+
+        asian_mask = recent["hour"].between(22, 23) | recent["hour"].between(0, 6)
+        london_mask = recent["hour"].between(7, 10)
+        ny_mask = recent["hour"].between(13, 17)
+
+    # Calculate actual ranges from the data (this part is instrument-agnostic and very useful)
     asian = recent[asian_mask]
     london = recent[london_mask]
     ny = recent[ny_mask]
@@ -674,30 +730,12 @@ def analyze_session_structure(
     asian_low = float(asian["low"].min()) if len(asian) > 3 else None
     asian_range = (asian_high - asian_low) if asian_high and asian_low else None
 
-    current_price = float(recent["close"].iloc[-1])
-    current_hour = int(recent["hour"].iloc[-1])
-
-    phase: SessionPhase = "UNKNOWN"
-    manipulation = False
-    expansion_dir = None
-
-    if 0 <= current_hour < 7 or 22 <= current_hour <= 23:
-        phase = "ASIAN"
-    elif 7 <= current_hour < 11:
-        phase = "LONDON_OPEN"
-    elif 11 <= current_hour < 13:
-        phase = "NY_OPEN"
-    elif 13 <= current_hour < 18:
-        phase = "NY_PM"
-    else:
-        phase = "OFF_SESSION"
-
-    # Detect London manipulation (sweep of Asian range + displacement)
-    if phase == "LONDON_OPEN" and asian_range and asian_range > 0:
+    # Detect manipulation (price breaking the overnight range during "London" equivalent hours)
+    if phase in ("LONDON_OPEN", "NY_OPEN") and asian_range and asian_range > 0:
         if current_price > asian_high or current_price < asian_low:
             manipulation = True
 
-    # Detect expansion out of Asian range during NY
+    # Detect expansion out of the overnight range
     if phase in ("NY_OPEN", "NY_PM") and asian_range and asian_range > 0:
         if current_price > asian_high * 1.0008:
             expansion_dir = "UP"
@@ -725,10 +763,10 @@ def compute_market_structure(
     df: pd.DataFrame,
     symbol: str = "UNKNOWN",
     timeframe: str = "M5",
-    swing_left: int = 3,   # Lowered for live bootstrapping with data feeders
-    swing_right: int = 3,  # Lowered for live bootstrapping with data feeders
-    min_candles: int = 15,   # Lowered for live data feeder bootstrapping (was 30)
-    # swing_left/right also lowered to 3 for early detection with limited bars
+    swing_left: int = 3,   # Lowered for live data feeder bootstrapping (needs fewer bars to detect swings)
+    swing_right: int = 3,  # Lowered for live data feeder bootstrapping (needs fewer bars to detect swings)
+    min_candles: int = 15,   # Lowered for live data feeder bootstrapping
+    # swing_left/right defaulted to 3 (instead of 5) for earlier detection with limited bars
 ) -> MarketStructure:
     """
     Primary function to call from signals / strategies.
@@ -799,39 +837,6 @@ def compute_market_structure(
     return ms
 
 
-# Convenience: lightweight dict for gradual migration (old-style consumers)
-def market_structure_to_legacy_features(ms: MarketStructure, df: pd.DataFrame) -> Dict:
-    """
-    Bridge function: convert rich structure into a flat dict similar to the old
-    compute_features output so existing strategy code can be ported incrementally.
-    """
-    close = float(df["close"].iloc[-1])
-    swing_high = max([s.price for s in ms.swings if s.swing_type == "HIGH"], default=close)
-    swing_low = min([s.price for s in ms.swings if s.swing_type == "LOW"], default=close)
-
-    fib_range = swing_high - swing_low
-    return {
-        "current_close": close,
-        "swing_high": swing_high,
-        "swing_low": swing_low,
-        "fib_618": swing_high - fib_range * 0.618,
-        "fib_500": swing_high - fib_range * 0.500,
-        "fib_382": swing_high - fib_range * 0.382,
-        "atr": ms.atr,
-        "session": ms.session.phase.lower() if ms.session.phase != "UNKNOWN" else "off",
-        "bias": ms.bias,
-        "manipulation_detected": ms.session.manipulation_detected,
-        "active_bull_obs": len([o for o in ms.order_blocks if o.ob_type == "BULLISH" and not o.is_mitigated]),
-        "active_bear_obs": len([o for o in ms.order_blocks if o.ob_type == "BEARISH" and not o.is_mitigated]),
-        "recent_displacement": ms.recent_displacement,
-        # Legacy placeholders (will be removed in full migration)
-        "ema_9": close,   # deliberately neutral
-        "ema_21": close,
-        "rsi": 50.0,
-        "macd_hist": 0.0,
-    }
-
-
 # =============================================================================
 # HUMAN READABLE PROGRESS / STATUS SUMMARY (used by realtime responses + UI)
 # =============================================================================
@@ -878,3 +883,36 @@ def generate_structure_summary(ms: MarketStructure) -> str:
         ).strip()
     except Exception:
         return f"{getattr(ms, 'bias', 'NEUTRAL')} bias | limited data"
+
+
+# Convenience: lightweight dict for gradual migration (old-style consumers)
+def market_structure_to_legacy_features(ms: MarketStructure, df: pd.DataFrame) -> Dict:
+    """
+    Bridge function: convert rich structure into a flat dict similar to the old
+    compute_features output so existing strategy code can be ported incrementally.
+    """
+    close = float(df["close"].iloc[-1])
+    swing_high = max([s.price for s in ms.swings if s.swing_type == "HIGH"], default=close)
+    swing_low = min([s.price for s in ms.swings if s.swing_type == "LOW"], default=close)
+
+    fib_range = swing_high - swing_low
+    return {
+        "current_close": close,
+        "swing_high": swing_high,
+        "swing_low": swing_low,
+        "fib_618": swing_high - fib_range * 0.618,
+        "fib_500": swing_high - fib_range * 0.500,
+        "fib_382": swing_high - fib_range * 0.382,
+        "atr": ms.atr,
+        "session": ms.session.phase.lower() if ms.session.phase != "UNKNOWN" else "off",
+        "bias": ms.bias,
+        "manipulation_detected": ms.session.manipulation_detected,
+        "active_bull_obs": len([o for o in ms.order_blocks if o.ob_type == "BULLISH" and not o.is_mitigated]),
+        "active_bear_obs": len([o for o in ms.order_blocks if o.ob_type == "BEARISH" and not o.is_mitigated]),
+        "recent_displacement": ms.recent_displacement,
+        # Legacy placeholders (will be removed in full migration)
+        "ema_9": close,   # deliberately neutral
+        "ema_21": close,
+        "rsi": 50.0,
+        "macd_hist": 0.0,
+    }
