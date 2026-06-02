@@ -335,7 +335,15 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
     # Map internal score to the old -1..1 range for partial compatibility
     mapped_score = best.score * (1.0 if best.direction == "BUY" else -1.0)
 
-    return {
+    # Recompute contextual scores for the response (they are computed inside evaluate_setups
+    # but not returned; this avoids NameError and keeps evaluate_setups API stable for backtests).
+    amd_score = amd.analyze_amd_structure(ms)
+    fib_score = fibonacci.analyze_fib_confluence(ms)
+    pa_score = price_action.analyze_price_action_contextual(ms)
+    liq_score = liquidity.analyze_liquidity_sweeps(ms)
+    total_confluence = amd_score + fib_score + pa_score + liq_score
+
+    result = {
         "signal": best.direction,
         "score": round(mapped_score, 4),
         "confidence": round(best.score * 100, 1),
