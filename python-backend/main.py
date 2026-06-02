@@ -206,3 +206,89 @@ def debug_live_buffer(symbol: str = None):
     for sym in list(live_buffer.buffers.keys()):
         all_status[sym] = live_buffer.get_buffer_status(sym)
     return {"all_symbols": all_status, "global_max_m1": live_buffer.max_bars}
+
+
+# =============================================================================
+# DASHBOARD / UI API SURFACE (used by Streamlit or any frontend)
+# =============================================================================
+
+@app.get("/api/system-status")
+def api_system_status():
+    """High level health + buffer fill for the top bar of the UI."""
+    return {
+        "status": "running",
+        "version": "2.1-realtime",
+        "timestamp": datetime.utcnow().isoformat(),
+        "buffer_max_m1": live_buffer.max_bars,
+        "symbols_tracked": list(live_buffer.buffers.keys()),
+    }
+
+
+@app.get("/api/recent-signals")
+def api_recent_signals(symbol: str = None, limit: int = 100):
+    """Powers the signal history table and 'signal build-up' charts in the UI."""
+    from app.db import ensure_live_tables
+    ensure_live_tables()
+    try:
+        q = """
+            SELECT ts, symbol, timeframe, signal, score, confidence, setup, rationale,
+                   structure_summary, bias, current_price, buffer_bars
+            FROM live_signals
+            WHERE (%s IS NULL OR symbol = %s)
+            ORDER BY ts DESC
+            LIMIT %s
+        """
+        cursor.execute(q, (symbol, symbol, limit))
+        rows = cursor.fetchall()
+        cols = [desc[0] for desc in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+    except Exception as e:
+        return {"error": str(e), "data": []}
+
+
+@app.get("/api/trades")
+def api_trades(symbol: str = None, limit: int = 200):
+    """Powers the Trades section of the UI."""
+    from app.db import ensure_live_tables
+    ensure_live_tables()
+    try:
+        q = """
+            SELECT ts, symbol, direction, entry_price, stop_loss, tp1, tp2,
+                   r_multiple, outcome, volume_lots, notes
+            FROM executed_trades
+            WHERE (%s IS NULL OR symbol = %s)
+            ORDER BY ts DESC
+            LIMIT %s
+        """
+        cursor.execute(q, (symbol, symbol, limit))
+        rows = cursor.fetchall()
+        cols = [desc[0] for desc in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+    except Exception as e:
+        return {"error": str(e), "data": []}
+
+
+@app.get("/api/current-structure/{symbol}")
+def api_current_structure(symbol: str):
+    """Quick snapshot for a symbol card in the UI (uses live buffer if available)."""
+    sym = normalize_symbol(symbol)
+    buf = live_buffer.get_recent_df(sym, limit=200)
+    status = live_buffer.get_buffer_status(sym)
+    if len(buf) < 5:
+        return {"symbol": sym, "status": "insufficient_live_data", "buffer": status}
+
+    try:
+        ms = compute_structure(buf, symbol=sym, timeframe="M1", min_candles=5)
+        summary = generate_structure_summary(ms)
+        return {
+            "symbol": sym,
+            "current_price": ms.current_price,
+            "bias": ms.bias,
+            "structure_summary": summary,
+            "active_bullish_obs": len([o for o in ms.order_blocks if o.ob_type == "BULLISH" and not o.is_mitigated]),
+            "active_bearish_obs": len([o for o in ms.order_blocks if o.ob_type == "BEARISH" and not o.is_mitigated]),
+            "swing_count": len(ms.swings),
+            "buffer": status,
+        }
+    except Exception as e:
+        return {"symbol": sym, "error": str(e), "buffer": status}
