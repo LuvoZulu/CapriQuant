@@ -159,13 +159,13 @@ def get_trading_signal(
         print(f"\n[SIGNAL RESPONSE] {normalized} {tf_upper}", json.dumps(response_body, indent=2, default=str))
         return response_body
 
-    # Prefer live buffer heavily for real-time decisions
+    # Strongly prefer live aggregated data for real-time structure decisions
     from app.live_data import get_recent_df, get_latest_price
-    live_df = get_recent_df(normalized, min_bars=12)  # Lower threshold for live path
+    live_df = get_recent_df(normalized, min_bars=10)
 
-    if live_df is not None and len(live_df) >= 8:
+    if live_df is not None and len(live_df) >= 6:
         df = live_df
-        # Use the absolute latest price
+        # Force the absolute latest price into the last bar for freshest decisions
         live_price = get_latest_price(normalized)
         if live_price:
             df.loc[df.index[-1], 'close'] = live_price['close']
@@ -174,10 +174,11 @@ def get_trading_signal(
             if 'low' in df.columns:
                 df.loc[df.index[-1], 'low'] = min(df.loc[df.index[-1], 'low'], live_price['close'])
     else:
+        # Only fall back to DB if we truly have almost nothing in the live buffer
         df = fetch_candles(conn, symbol, tf_upper, engine=engine, min_candles_override=min_candles)
 
     if engine == "structure":
-        ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 12)
+        ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 10)
         result = get_structure_signal(ms, spread)
     else:
         features = compute_features(df)

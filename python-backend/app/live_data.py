@@ -1,43 +1,56 @@
 """
-Live Data Buffer for real-time structure analysis.
-Maintains recent bars in memory per symbol so we can run the structure engine
-on fresh data instead of waiting for DB.
+Real-time Live Data Buffer with proper M1 bar aggregation.
+
+This version aggregates incoming TICK data into clean M1 bars so the
+structure engine can properly detect swings, Order Blocks, BOS/CHOCH, etc.
+from recent live market movement instead of stale DB data.
 """
 
 from collections import deque
-from typing import Dict, List, Optional, Deque
+from typing import Dict, Optional, Deque
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 
-# Store last N bars per symbol (normalized symbol)
-# Each bar: {'timestamp': datetime, 'open': float, 'high': float, 'low': float, 'close': float, 'volume': float}
-LIVE_BUFFERS: Dict[str, Deque[dict]] = {}
+# Per-symbol buffer of completed M1 bars + the current forming bar
+# Each entry: {'timestamp': datetime, 'open': float, 'high': float, 'low': float, 'close': float, 'volume': float}
+LIVE_BARS: Dict[str, Deque[dict]] = {}
 
-# How many bars to keep in memory per symbol (enough for swing detection + structure)
-MAX_BARS_PER_SYMBOL = 300
+# How many completed M1 bars to keep per symbol (enough for good swing detection)
+MAX_COMPLETED_BARS = 700
+
+
+def _floor_to_minute(ts: datetime) -> datetime:
+    """Floor a timestamp to the start of its minute."""
+    return ts.replace(second=0, microsecond=0)
 
 
 def update_live_bar(symbol: str, bar: dict):
     """
-    Update the live buffer with a new bar or tick.
-    If it's a TICK, we update the current forming bar.
-    Expects bar to have at least 'close'. Optional: open, high, low, volume, timestamp.
+    Feed new market data (from TICK or bar updates) into the live buffer.
+
+    This function aggregates data into proper M1 bars.
+    Call this on every incoming payload from the EA.
     """
     symbol = symbol.upper()
 
-    if symbol not in LIVE_BUFFERS:
-        LIVE_BUFFERS[symbol] = deque(maxlen=MAX_BARS_PER_SYMBOL)
+    if symbol not in LIVE_BARS:
+        LIVE_BARS[symbol] = deque(maxlen=MAX_COMPLETED_BARS + 1)
 
-    buffer = LIVE_BUFFERS[symbol]
+    buffer = LIVE_BARS[symbol]
 
-    ts = bar.get("timestamp")
-    if ts is None:
-        ts = datetime.utcnow()
-    elif isinstance(ts, str):
+    # Determine the timestamp of this update
+    ts_raw = bar.get("timestamp")
+    if ts_raw is None:
+        ts = datetime.now(timezone.utc)
+    elif isinstance(ts_raw, str):
         try:
-            ts = pd.to_datetime(ts)
+            ts = pd.to_datetime(ts_raw).to_pydatetime()
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
         except:
-            ts = datetime.utcnow()
+            ts = datetime.now(timezone.utc)
+    else:
+        ts = ts_raw
 
     close = float(bar.get("close", 0))
     open_ = float(bar.get("open", close))
@@ -45,32 +58,53 @@ def update_live_bar(symbol: str, bar: dict):
     low = float(bar.get("low", close))
     volume = float(bar.get("volume", 0))
 
-    new_bar = {
-        "timestamp": ts,
-        "open": open_,
-        "high": high,
-        "low": low,
-        "close": close,
-        "volume": volume,
-    }
+    bar_minute = _floor_to_minute(ts)
 
-    if buffer and buffer[-1]["timestamp"] == new_bar["timestamp"]:
-        # Update current bar (typical for tick updates on same bar)
-        buffer[-1] = new_bar
+    if not buffer:
+        # First ever bar for this symbol
+        buffer.append({
+            "timestamp": bar_minute,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+        })
+        return
+
+    last_bar = buffer[-1]
+
+    if last_bar["timestamp"] == bar_minute:
+        # Still inside the same minute → update the current forming bar
+        last_bar["high"] = max(last_bar["high"], high)
+        last_bar["low"] = min(last_bar["low"], low)
+        last_bar["close"] = close
+        last_bar["volume"] += volume
     else:
-        buffer.append(new_bar)
+        # New minute started → the previous bar is now complete.
+        # Append the new forming bar.
+        buffer.append({
+            "timestamp": bar_minute,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+        })
 
 
-def get_recent_df(symbol: str, min_bars: int = 30) -> Optional[pd.DataFrame]:
+def get_recent_df(symbol: str, min_bars: int = 15) -> Optional[pd.DataFrame]:
     """
-    Return a DataFrame of recent bars for the symbol, ready for compute_market_structure.
-    Returns None if not enough data.
+    Returns a DataFrame of recent M1 bars (completed + current forming)
+    ready to be fed into compute_market_structure.
+
+    This is the main function the real-time signal logic should use.
     """
     symbol = symbol.upper()
-    if symbol not in LIVE_BUFFERS:
+    if symbol not in LIVE_BARS:
         return None
 
-    buffer = LIVE_BUFFERS[symbol]
+    buffer = LIVE_BARS[symbol]
     if len(buffer) < min_bars:
         return None
 
@@ -81,11 +115,12 @@ def get_recent_df(symbol: str, min_bars: int = 30) -> Optional[pd.DataFrame]:
 
 
 def get_latest_price(symbol: str) -> Optional[dict]:
-    """Quick access to the most recent price info."""
+    """Returns the most recent close + timestamp from the live buffer."""
     symbol = symbol.upper()
-    if symbol not in LIVE_BUFFERS or not LIVE_BUFFERS[symbol]:
+    if symbol not in LIVE_BARS or not LIVE_BARS[symbol]:
         return None
-    last = LIVE_BUFFERS[symbol][-1]
+
+    last = LIVE_BARS[symbol][-1]
     return {
         "timestamp": last["timestamp"],
         "close": last["close"],
@@ -94,9 +129,36 @@ def get_latest_price(symbol: str) -> Optional[dict]:
     }
 
 
+def get_buffer_length(symbol: str) -> int:
+    """Debug helper."""
+    symbol = symbol.upper()
+    return len(LIVE_BARS.get(symbol, []))
+
+
 def clear_buffer(symbol: str = None):
-    """Mainly for testing/debugging."""
+    """Mainly for debugging."""
     if symbol:
-        LIVE_BUFFERS.pop(symbol.upper(), None)
+        LIVE_BARS.pop(symbol.upper(), None)
     else:
-        LIVE_BUFFERS.clear()
+        LIVE_BARS.clear()
+
+
+def get_all_buffer_lengths() -> dict:
+    """Returns how many bars are currently stored in the live buffer for each symbol."""
+    return {sym: len(buf) for sym, buf in LIVE_BARS.items()}
+
+
+def get_buffer_info(symbol: str) -> dict:
+    """Returns detailed info about the live buffer for one symbol."""
+    symbol = symbol.upper()
+    if symbol not in LIVE_BARS or not LIVE_BARS[symbol]:
+        return {"symbol": symbol, "count": 0, "oldest": None, "newest": None}
+
+    buf = LIVE_BARS[symbol]
+    return {
+        "symbol": symbol,
+        "count": len(buf),
+        "oldest": buf[0]["timestamp"].isoformat() if buf else None,
+        "newest": buf[-1]["timestamp"].isoformat() if buf else None,
+        "latest_close": buf[-1]["close"] if buf else None,
+    }

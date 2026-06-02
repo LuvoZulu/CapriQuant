@@ -1,5 +1,6 @@
 from fastapi import FastAPI, BackgroundTasks
 import logging
+import json
 import pandas as pd
 from app.db import conn, cursor
 from app.api.signals import router as signal_router
@@ -56,9 +57,10 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
     # 2. Try to compute real-time signal using recent live data (more aggressive for live path)
     signal_result = None
     try:
-        recent_df = get_recent_df(symbol, min_bars=12)
-        if recent_df is not None and len(recent_df) >= 8:
-            ms = compute_structure(recent_df, symbol=symbol, timeframe=timeframe, min_candles=8)
+        recent_df = get_recent_df(symbol, min_bars=10)
+        if recent_df is not None and len(recent_df) >= 6:
+            # Use a very lenient min_candles for the live path so structure can start forming earlier
+            ms = compute_structure(recent_df, symbol=symbol, timeframe=timeframe, min_candles=6)
             signal_result = get_structure_signal(ms, spread=data.get("spread", 0.0))
     except Exception as e:
         logger.error(f"Real-time structure processing failed for {symbol}: {e}")
@@ -81,12 +83,15 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
 
     if signal_result:
         response["signal"] = signal_result
+        # Pretty print the real-time signal we just computed from live data
+        print(f"\n[REALTIME SIGNAL from POST] {symbol} {timeframe}", json.dumps(signal_result, indent=2, default=str))
     else:
         response["signal"] = {
             "signal": "HOLD",
             "confidence": 0.0,
             "rationale": "Insufficient live bars for structure analysis yet."
         }
+        print(f"\n[REALTIME SIGNAL from POST] {symbol} {timeframe} → HOLD (not enough live bars yet)")
 
     # 4. Store to DB in background (after we already responded to MT5)
     def _persist_to_db():
@@ -117,3 +122,26 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
     background_tasks.add_task(_persist_to_db)
 
     return response
+
+
+# =============================================================================
+# DEBUG ENDPOINTS - Live Buffer Inspection
+# =============================================================================
+
+@app.get("/debug/live-buffer")
+def debug_live_buffer_all():
+    """Returns how many bars are currently in the live buffer for each symbol."""
+    from app.live_data import get_all_buffer_lengths
+    return {
+        "live_buffer_counts": get_all_buffer_lengths(),
+        "note": "These are the number of recent M1 bars (completed + current) kept in memory for real-time structure analysis."
+    }
+
+
+@app.get("/debug/live-buffer/{symbol}")
+def debug_live_buffer_symbol(symbol: str):
+    """Returns detailed information about the live buffer for one symbol."""
+    from app.live_data import get_buffer_info
+    info = get_buffer_info(symbol)
+    info["note"] = "This shows how much recent live data is available for real-time decision making."
+    return info
