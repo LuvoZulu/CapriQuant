@@ -128,7 +128,15 @@ def market_data(data: dict):
 
                 signal["current_price"] = current_price
                 signal["realtime"] = True
-                signal["buffer_status"] = live_buffer.get_buffer_status(symbol)
+                buf_status = live_buffer.get_buffer_status(symbol)
+                signal["buffer_status"] = buf_status
+
+                # Persist for UI historical + "signal building progress" charts
+                try:
+                    from app.db import persist_signal
+                    persist_signal(signal, symbol, "TICK", buffer_bars=buf_status.get("bars_in_buffer", 0))
+                except Exception:
+                    pass
 
                 print(f"\n[REALTIME SIGNAL from POST] {symbol} TICK {json.dumps(signal, indent=2, default=str)[:500]}...")
                 return signal
@@ -165,6 +173,22 @@ def market_data(data: dict):
         "timeframe": timeframe,
         "realtime_buffer": buf_status,
     }
+
+
+@app.post("/report-trade")
+def report_trade(trade: dict):
+    """
+    Endpoint for the AutoTrader EA (or any executor) to report filled / managed trades.
+    Powers the 'Trades' section of the UI and historical performance tracking.
+    """
+    sym = normalize_symbol(trade.get("symbol", ""))
+    trade["symbol"] = sym
+
+    try:
+        persist_trade(trade)
+        return {"status": "trade_recorded", "symbol": sym}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 
 # Debug endpoint for the live buffer (very useful for the UI and debugging)

@@ -175,6 +175,14 @@ def get_trading_signal(
         except Exception:
             pass
 
+        # Persist to DB for historical UI queries and signal progress tracking
+        try:
+            from app.db import persist_signal
+            buf_count = 0  # For DB polls we don't have the live buffer count here; realtime path has it
+            persist_signal(result, normalized, tf_upper, buffer_bars=buf_count)
+        except Exception:
+            pass
+
     response_body = {
         "symbol": normalized,
         "timeframe": tf_upper,
