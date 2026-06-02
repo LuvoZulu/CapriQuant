@@ -98,11 +98,15 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
         "timeframe": timeframe,
     }
 
-    # latest price
+    # latest price - prefer completed, fall back to forming bar if no completed yet
     try:
         latest = live_buffer.get_recent_bars(symbol)
         if latest:
             response["current_price"] = latest[-1].close
+        else:
+            forming = live_buffer.forming.get(symbol.upper())
+            if forming:
+                response["current_price"] = forming.get("close", data.get("close", 0))
     except Exception:
         pass
 
@@ -159,7 +163,9 @@ def debug_live_buffer(symbol: str = None):
             "status": live_buffer.get_buffer_status(sym),
             "recent_bars_count": len(live_buffer.get_recent_bars(sym)),
         }
-    all_status = {sym: live_buffer.get_buffer_status(sym) for sym in list(live_buffer.buffers.keys())}
+    # Include symbols that have completed bars or are currently forming a bar
+    tracked = set(live_buffer.buffers.keys()) | set(live_buffer.forming.keys())
+    all_status = {sym: live_buffer.get_buffer_status(sym) for sym in tracked}
     return {"all_symbols": all_status, "global_max_m1": live_buffer.max_bars}
 
 

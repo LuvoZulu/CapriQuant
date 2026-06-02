@@ -131,7 +131,7 @@ class LiveDataManager:
         return completed
 
     def get_recent_bars(self, symbol: str, limit: Optional[int] = None) -> List[CompletedBar]:
-        """Return the most recent completed M1 bars (newest last)."""
+        """Return the most recent completed M1 bars (newest last). Does not include the current forming bar."""
         buf = self.buffers.get(symbol.upper(), deque())
         bars = list(buf)
         if limit:
@@ -139,8 +139,23 @@ class LiveDataManager:
         return bars
 
     def get_recent_df(self, symbol: str, limit: Optional[int] = None) -> pd.DataFrame:
-        """Convenience: bars as DataFrame ready for compute_structure / compute_market_structure."""
-        bars = self.get_recent_bars(symbol, limit)
+        """Convenience: bars as DataFrame ready for compute_structure / compute_market_structure.
+        Includes completed bars + the current forming bar (as the latest entry) if present.
+        This ensures the live buffer is useful even before a full minute completes.
+        """
+        bars = self.get_recent_bars(symbol, limit)  # completed only
+        forming = self.forming.get(symbol.upper())
+        if forming:
+            forming_bar = CompletedBar(
+                symbol=symbol.upper(),
+                timestamp=forming.get("timestamp", datetime.utcnow()),
+                open=forming["open"],
+                high=forming["high"],
+                low=forming["low"],
+                close=forming["close"],
+                volume=forming.get("volume", 0.0),
+            )
+            bars = bars + [forming_bar]
         if not bars:
             return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
@@ -161,12 +176,15 @@ class LiveDataManager:
 
     def get_buffer_status(self, symbol: str) -> Dict[str, Any]:
         buf = self.buffers.get(symbol.upper(), deque())
-        count = len(buf)
+        completed_count = len(buf)
+        has_forming = symbol.upper() in self.forming
+        effective_count = completed_count + (1 if has_forming else 0)
         return {
             "symbol": symbol.upper(),
-            "bars_in_buffer": count,
+            "bars_in_buffer": completed_count,  # only completed previous minutes
+            "effective_bars": effective_count,  # completed + current forming (for UI/debug)
             "max_bars": self.max_bars,
-            "pct_full": round(count / self.max_bars * 100, 2) if self.max_bars > 0 else 0,
+            "pct_full": round(effective_count / self.max_bars * 100, 2) if self.max_bars > 0 else 0,
             "ticks_received": self.stats[symbol.upper()]["ticks_received"],
             "bars_completed": self.stats[symbol.upper()]["bars_completed"],
             "forming_bar": self.forming.get(symbol.upper()),
