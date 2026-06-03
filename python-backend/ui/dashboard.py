@@ -38,6 +38,50 @@ SYMBOLS = ["US30", "USTEC", "DE30", "XAUUSD"]  # extend as you add more
 st.set_page_config(page_title="CapriQuant - Live Structure Dashboard", layout="wide")
 st.title("CapriQuant • Real-time Structure & Signal Progress")
 
+# =============================================================================
+# KILL SWITCH / SYSTEM MODE CONTROLS (Phase 2 P1 - always visible, high priority)
+# =============================================================================
+mode_resp = {}
+try:
+    mode_resp = requests.get(f"{BACKEND}/api/system-mode", timeout=2).json()
+except Exception:
+    mode_resp = {"mode": "unknown"}
+current_mode = mode_resp.get("mode", "trading")
+
+mode_color = {"trading": "🟢", "paused": "🟡", "flatten": "🔴"}.get(current_mode, "⚪")
+st.markdown(f"### System Mode: {mode_color} **{current_mode.upper()}**")
+
+col1, col2, col3, col4 = st.columns(4)
+if col1.button("🚨 EMERGENCY FLATTEN ALL + PAUSE", type="primary", use_container_width=True):
+    try:
+        r = requests.post(f"{BACKEND}/api/control", json={"action": "flatten_all"}, timeout=5)
+        st.error(f"FLATTEN sent: {r.json()}")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Control failed: {e}")
+
+if col2.button("⏸️ PAUSE TRADING (HOLD only)", use_container_width=True):
+    try:
+        r = requests.post(f"{BACKEND}/api/control", json={"action": "pause"}, timeout=5)
+        st.warning(f"PAUSE sent: {r.json()}")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Control failed: {e}")
+
+if col3.button("▶️ RESUME NORMAL TRADING", use_container_width=True):
+    try:
+        r = requests.post(f"{BACKEND}/api/control", json={"action": "resume"}, timeout=5)
+        st.success(f"RESUME sent: {r.json()}")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Control failed: {e}")
+
+if col4.button("Refresh mode", use_container_width=True):
+    st.rerun()
+
+if current_mode != "trading":
+    st.warning(f"**SYSTEM IS IN {current_mode.upper()} MODE** — normal signals are suppressed. Use RESUME to restore trading.")
+
 # Sidebar controls
 st.sidebar.header("Controls")
 auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)

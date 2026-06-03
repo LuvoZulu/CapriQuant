@@ -37,6 +37,28 @@ def release_conn(cur, conn):
         if conn and get_pool(): get_pool().putconn(conn)
     except: pass
 
+from contextlib import contextmanager
+
+@contextmanager
+def db_cursor():
+    """Safe context manager for pooled connections. Auto release + rollback on error.
+    Usage:
+        with db_cursor() as (conn, cur):
+            cur.execute(...)
+    """
+    conn = None
+    cur = None
+    try:
+        conn, cur = get_conn_cursor()
+        yield conn, cur
+    except Exception:
+        if conn:
+            try: conn.rollback()
+            except: pass
+        raise
+    finally:
+        release_conn(cur, conn)
+
 # Keep legacy for minimal breakage
 try:
     conn = psycopg2.connect(

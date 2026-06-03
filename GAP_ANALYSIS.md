@@ -150,11 +150,13 @@ It will probably never be a "Renaissance-style quant fund" (different philosophy
 **Next step recommendation:** Pick the top 3 Tier 1 items (full risk wiring, real backtest fidelity + costs, test suite) and implement them end-to-end with verification on your historical CSVs. That alone would put it in the top 5-10% of retail/prop automated structure systems.
 
 **2026-06 UPDATE: Recommended immediate next actions (the 4 P0) HAVE BEEN EXECUTED.**
-- 1. RiskManager fully wired as hard veto layer in both /signal (with ?equity=) and realtime /market-data POST paths. Uses live equity from EA + get_recent_loss_streak + get_today_realized_r from executed_trades. can_take_trade non-bypassable -> forces HOLD + rationale. Risk fields + validated_stop promoted in responses (EA already honors). can_trade_today + streak>=4 hard circuits active.
-- 2. replay.py upgraded to honest: uses get_structure_signal (full prod path), RiskManager for dynamic risk_pct + veto inside sim, costs (spread*2 + commission_r) subtracted from every r_multiple, next-bar entry, next-bar+ wick sim, max_dd, costs_applied in summary, streak tracking for de-risk.
-- 3. tests/test_risk.py added (6 tests for sizing, daily/streak circuits, validate_stop, calc). Existing test_*.py cover structure/BOS, signal path, backtest determinism. All verified runnable via direct + pytest in CI.
-- 4. Secrets fixed: python-backend/.env + security/* removed from git index (git rm --cached, locals preserved), .gitignore hardened with ** patterns. .github/workflows/ci.yml added: py setup, pip -r, import smoke (risk+structure+confluence), pytest on tests/, honest backtest regression, source-level risk wiring assertion.
+- 1-4 as before (Risk hard layer, honest backtest, tests, secrets+CI).
 
-All 4 completed + committed (see git log "P0: execute Recommended..."). System now has non-bypassable risk circuits, statistically honest backtest, foundation tests, and clean ops for secrets/CI.
+**Phase 2 (Production Hardening...) STARTED & SIGNIFICANT PROGRESS:**
+See NEXT_PHASE.md for full outline + current status.
+Executed: Kill switch (full E2E: backend control+mode+override, EA close, prominent UI red buttons + status, persisted), DB pool adoption (context helper + refactors in main/signals for apis/queries/persist), Data quality gate (ingest validate + status exposure + skip on bad), Structured/metrics (/metrics + ids), EA canonical progress (kill added to both main variants, one marked recommended).
+Remaining this phase: post-entry mgmt, dashboard curve/attr, CRT wire (high value).
+
+All changes committed where possible; tests green; no breakage to prior UI/tracking/risk.
 
 Would you like a prioritized implementation plan + code sketches for the top gaps (e.g., full RiskManager integration first)? Or focus on one area?

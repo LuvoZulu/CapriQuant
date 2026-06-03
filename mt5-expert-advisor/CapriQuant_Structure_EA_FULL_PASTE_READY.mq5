@@ -1,14 +1,15 @@
 //+------------------------------------------------------------------+
 //|           CapriQuant_Structure_EA_FULL_PASTE_READY.mq5           |
 //|                                                                  |
-//|  REAL-TIME AUTO-TRADER EA with trade tracking (v5.3-fixed)       |
+//|  REAL-TIME AUTO-TRADER EA with trade tracking (v5.4-phase2)      |
+//|  *** CANONICAL / RECOMMENDED PASTE-READY VERSION ***             |
+//|  (other .mq5 variants are legacy - use this one)                 |
 //|                                                                  |
-//|  - Sends market data on every tick (throttled)                   |
-//|  - Polls /signal frequently                                      |
-//|  - Trades high confluence signals with structural SL/TP          |
-//|  - Reports opens and closes (with SL/TP reason) to /report-trade |
-//|    so the Streamlit dashboard can show live running trades       |
-//|    and exactly why they closed (SL hit vs TP hit)                |
+//|  - Sends market data on every tick (throttled) + equity          |
+//|  - Polls /signal + realtime POST path                            |
+//|  - Trades high confluence + server risk_pct / validated_stop     |
+//|  - Reports opens/closes (SL/TP/kill reasons) for dashboard       |
+//|  - Supports kill switch (FLATTEN / PAUSE) from backend/UI        |
 //|                                                                  |
 //|  INSTRUCTIONS:                                                   |
 //|  1. Open MetaEditor                                              |
@@ -232,6 +233,23 @@ void ProcessSignalResponse(string json)
    // Server can send risk_pct to override the input (never assign to input var!)
    double server_risk_pct = ExtractJsonDouble(json, "risk_pct");
 
+   // ===== KILL SWITCH (phase2) =====
+   string sysMode = ExtractJsonString(json, "system_mode");
+   string action  = ExtractJsonString(json, "action");
+   if(sysMode == "flatten" || action == "flatten_all" || signalDir == "FLATTEN")
+   {
+      Print("[CapriQuant] *** KILL/FLATTEN: ", rationale);
+      CloseAllPositions("kill_switch");
+      SendTradeReport("SYSTEM", 0, 0, 0, 0, "flatten", 0, "system", 0, "flatten");
+      return;
+   }
+   if(sysMode == "paused")
+   {
+      Print("[CapriQuant] SYSTEM PAUSED - HOLD only");
+      return;
+   }
+   // ===============================
+
    if(signalDir == "HOLD")
    {
       int candles = (int)ExtractJsonDouble(json, "candles_available");
@@ -365,6 +383,38 @@ bool HasOpenPosition()
       }
    }
    return false;
+}
+
+// Close all for this EA (kill switch support - phase2)
+void CloseAllPositions(string reason = "kill_switch")
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong posTicket = PositionGetTicket(i);
+      if(PositionSelectByTicket(posTicket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == currentSymbol &&
+            PositionGetInteger(POSITION_MAGIC) == Magic)
+         {
+            MqlTradeRequest req = {};
+            MqlTradeResult  res = {};
+            req.action   = TRADE_ACTION_DEAL;
+            req.position = posTicket;
+            req.symbol   = currentSymbol;
+            req.volume   = PositionGetDouble(POSITION_VOLUME);
+            req.type     = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+            req.price    = (req.type == ORDER_TYPE_SELL) ? SymbolInfoDouble(currentSymbol, SYMBOL_BID) : SymbolInfoDouble(currentSymbol, SYMBOL_ASK);
+            req.deviation = 30;
+            req.magic    = Magic;
+            req.comment  = "CapriQuant-" + reason;
+            if(OrderSend(req, res))
+            {
+               Print("[CapriQuant] KILL/CLOSE executed ticket=", posTicket, " reason=", reason);
+               SendTradeReport("CLOSE", req.volume, 0, 0, 0, reason, posTicket, "closed", req.price, reason);
+            }
+         }
+      }
+   }
 }
 
 // CalculateLots now accepts optional riskPct so we can use server value without touching the input

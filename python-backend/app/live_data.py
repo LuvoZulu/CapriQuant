@@ -100,6 +100,7 @@ def add_market_data(symbol: str, data: dict) -> None:
     This function aggregates into per-minute bars.
     The last bar for the symbol is the current minute and is updated in place on every call within the minute.
     Call this on every incoming payload from the EA.
+    If data has _quality_bad (from main ingest gate), still buffers (for diagnostics) but callers should prefer skipping structure on bad data.
     """
     symbol = _resolve_buffer_key(symbol)
 

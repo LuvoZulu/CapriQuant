@@ -8,6 +8,13 @@ from app.utils.signal_logger import log_signal
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
 
+# For kill switch / system mode (shared with main)
+try:
+    from main import get_system_mode, _apply_system_mode_to_signal  # type: ignore
+except Exception:
+    def get_system_mode(): return "trading"
+    def _apply_system_mode_to_signal(d, s=""): return d
+
 router = APIRouter()
 
 CANDLE_LIMIT = 200
@@ -37,10 +44,18 @@ def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min
         ORDER BY timestamp DESC
         LIMIT %s
     """
-    cursor = conn.cursor()
-    cursor.execute(query, (normalized_symbol, timeframe, CANDLE_LIMIT))
-    rows = cursor.fetchall()
-    cursor.close()
+    # Prefer pooled cursor if a raw conn was passed; fall back
+    from app.db import db_cursor
+    try:
+        with db_cursor() as (c, cur):
+            cur.execute(query, (normalized_symbol, timeframe, CANDLE_LIMIT))
+            rows = cur.fetchall()
+    except Exception:
+        # legacy fallback
+        cursor = conn.cursor()
+        cursor.execute(query, (normalized_symbol, timeframe, CANDLE_LIMIT))
+        rows = cursor.fetchall()
+        cursor.close()
 
     # Default minimums
     default_min = 15 if engine == "structure" else MIN_CANDLES_FOR_SIGNAL   # lowered for live bootstrapping
@@ -67,40 +82,39 @@ def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min
 
 @router.get("/debug/data-count")
 def get_data_count(symbol: str = None, timeframe: str = None):
-    """Debug endpoint to see how much data exists for a symbol/timeframe"""
-    from app.db import conn
-    cursor = conn.cursor()
-
-    if symbol:
-        normalized = normalize_symbol(symbol)
-        if timeframe:
-            cursor.execute(
-                "SELECT COUNT(*) FROM market_data WHERE symbol = %s AND timeframe = %s",
-                (normalized, timeframe.upper())
-            )
-            count = cursor.fetchone()[0]
-            cursor.close()
-            return {
-                "normalized_symbol": normalized,
-                "timeframe": timeframe.upper(),
-                "candle_count": count,
-                "ready_for_default_structure": count >= 30,
-                "ready_for_min_8 (what your EA uses)": count >= 8,
-                "note": "Your EA currently requests with min_candles=8. Once candle_count >= 8, real structure signals can be generated (even if still weak)."
-            }
-        else:
-            cursor.execute(
-                "SELECT timeframe, COUNT(*) FROM market_data WHERE symbol = %s GROUP BY timeframe",
-                (normalized,)
-            )
-            rows = cursor.fetchall()
-            cursor.close()
-            return {"normalized_symbol": normalized, "by_timeframe": dict(rows)}
-    else:
-        cursor.execute("SELECT symbol, timeframe, COUNT(*) FROM market_data GROUP BY symbol, timeframe ORDER BY symbol, timeframe")
-        rows = cursor.fetchall()
-        cursor.close()
-        return {"all_data": [{"symbol": r[0], "timeframe": r[1], "count": r[2]} for r in rows]}
+    """Debug endpoint to see how much data exists for a symbol/timeframe (pooled)"""
+    from app.db import db_cursor
+    try:
+        with db_cursor() as (c, cursor):
+            if symbol:
+                normalized = normalize_symbol(symbol)
+                if timeframe:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM market_data WHERE symbol = %s AND timeframe = %s",
+                        (normalized, timeframe.upper())
+                    )
+                    count = cursor.fetchone()[0]
+                    return {
+                        "normalized_symbol": normalized,
+                        "timeframe": timeframe.upper(),
+                        "candle_count": count,
+                        "ready_for_default_structure": count >= 30,
+                        "ready_for_min_8 (what your EA uses)": count >= 8,
+                        "note": "Your EA currently requests with min_candles=8. Once candle_count >= 8, real structure signals can be generated (even if still weak)."
+                    }
+                else:
+                    cursor.execute(
+                        "SELECT timeframe, COUNT(*) FROM market_data WHERE symbol = %s GROUP BY timeframe",
+                        (normalized,)
+                    )
+                    rows = cursor.fetchall()
+                    return {"normalized_symbol": normalized, "by_timeframe": dict(rows)}
+            else:
+                cursor.execute("SELECT symbol, timeframe, COUNT(*) FROM market_data GROUP BY symbol, timeframe ORDER BY symbol, timeframe")
+                rows = cursor.fetchall()
+                return {"all_data": [{"symbol": r[0], "timeframe": r[1], "count": r[2]} for r in rows]}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @router.get("/signal/{symbol}/{timeframe}")
@@ -127,29 +141,22 @@ def get_trading_signal(
     min_required = min_candles if min_candles is not None else default_min
     min_required = max(min_required, 5)
 
-    cursor = conn.cursor()
+    candles_available = 0
+    from app.db import db_cursor
     try:
-        try:
-            conn.rollback()  # clear any previous aborted tx from other queries (e.g. dashboard)
-        except:
-            pass
-        cursor.execute(
-            "SELECT COUNT(*) FROM market_data WHERE symbol = %s AND timeframe = %s",
-            (normalized, tf_upper)
-        )
-        candles_available = cursor.fetchone()[0]
+        with db_cursor() as (c, cursor):
+            try:
+                c.rollback()
+            except:
+                pass
+            cursor.execute(
+                "SELECT COUNT(*) FROM market_data WHERE symbol = %s AND timeframe = %s",
+                (normalized, tf_upper)
+            )
+            candles_available = cursor.fetchone()[0] or 0
     except Exception as e:
         print(f"[SIGNALS] count candles failed for {normalized}: {e}")
-        try:
-            conn.rollback()
-        except:
-            pass
         candles_available = 0
-    finally:
-        try:
-            cursor.close()
-        except:
-            pass
 
     if candles_available < min_required:
         friendly = {
@@ -176,6 +183,8 @@ def get_trading_signal(
             **friendly,
         }
         print(f"\n[SIGNAL RESPONSE] {normalized} {tf_upper}", json.dumps(response_body, indent=2, default=str))
+        # Still respect kill switch even on insufficient data path
+        response_body = _apply_system_mode_to_signal(response_body, normalized)
         return response_body
 
     # Strongly prefer live aggregated data for real-time structure decisions
@@ -280,6 +289,9 @@ def get_trading_signal(
         response_body.update(risk_info)
     if final_signal == "HOLD" and response_body.get("signal") != "HOLD":
         response_body["signal"] = "HOLD"
+
+    # Apply system kill/pause mode as final hard layer (after risk)
+    response_body = _apply_system_mode_to_signal(response_body, normalized)
 
     # === Force live price into the response for real-time feel ===
     try:

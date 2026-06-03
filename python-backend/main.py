@@ -12,6 +12,55 @@ from app.utils.symbols import symbol_sql_match
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
 
+# =============================================================================
+# KILL SWITCH / SYSTEM MODE (phase 2 P1)
+# Persisted to simple file for restart safety. Modes: "trading" (normal), "paused" (hold only), "flatten" (close everything + hold)
+# =============================================================================
+import os
+from pathlib import Path
+import uuid
+CONTROL_STATE_FILE = Path("logs/system_mode.json")
+CONTROL_STATE_FILE.parent.mkdir(exist_ok=True)
+
+SYSTEM_MODE = "trading"  # default
+
+# Simple recent ingest quality (last N bad per symbol) for /status
+_QUALITY_BAD = {}  # symbol -> list of (ts, reasons)
+_MAX_QUALITY_BAD = 5
+
+def _load_system_mode():
+    global SYSTEM_MODE
+    try:
+        if CONTROL_STATE_FILE.exists():
+            with open(CONTROL_STATE_FILE) as f:
+                data = json.load(f)
+                m = data.get("mode", "trading")
+                if m in ("trading", "paused", "flatten"):
+                    SYSTEM_MODE = m
+    except Exception:
+        pass
+    return SYSTEM_MODE
+
+def _save_system_mode(mode: str):
+    global SYSTEM_MODE
+    if mode not in ("trading", "paused", "flatten"):
+        mode = "trading"
+    SYSTEM_MODE = mode
+    try:
+        with open(CONTROL_STATE_FILE, "w") as f:
+            json.dump({"mode": mode, "ts": datetime.utcnow().isoformat()}, f)
+    except Exception as e:
+        logger.error(f"Failed to persist system mode: {e}")
+    return SYSTEM_MODE
+
+_load_system_mode()  # init on startup
+
+def get_system_mode() -> str:
+    return SYSTEM_MODE
+
+def set_system_mode(mode: str) -> str:
+    return _save_system_mode(mode)
+
 app = FastAPI(title="CapriQuant", version="2.0")
 
 app.include_router(signal_router)
@@ -43,23 +92,73 @@ def normalize_symbol(symbol: str) -> str:
 def market_data(data: dict, background_tasks: BackgroundTasks):
     symbol = normalize_symbol(data.get("symbol", "UNKNOWN"))
     timeframe = data.get("timeframe", "M5").upper()
+    req_id = str(uuid.uuid4())[:8]
 
-    # Log live data
-    logger.info(f"[LIVE DATA] {symbol} {timeframe} | Close={data.get('close')} | Bid={data.get('bid')} | Ask={data.get('ask')} | Volume={data.get('volume')}")
+    # === Data Quality Gate (phase2) - reject poison early ===
+    try:
+        qclose = float(data.get("close") or 0)
+        qspread = float(data.get("spread") or data.get("ask", 0) - data.get("bid", 0) or 0)
+        qts = data.get("timestamp")
+        qvol = float(data.get("volume") or 0)
+        bad_reasons = []
+        if qclose <= 0:
+            bad_reasons.append("price<=0")
+        # Reasonable bounds (extendable via config later)
+        if symbol in ("XAUUSD", "XAU") and not (500 < qclose < 5000):
+            bad_reasons.append("xau_price_out_of_range")
+        if symbol in ("US30", "USTEC", "DE30") and not (5000 < qclose < 100000):
+            bad_reasons.append("index_price_out_of_range")
+        if qspread < 0 or qspread > 1000:  # generous for indices
+            bad_reasons.append(f"bad_spread:{qspread}")
+        if qts:
+            # basic future/past check (allow some clock skew)
+            try:
+                from datetime import datetime as _dt
+                if isinstance(qts, (int, float)):
+                    ts_dt = _dt.utcfromtimestamp(qts / 1000 if qts > 1e12 else qts)
+                else:
+                    ts_dt = _dt.fromisoformat(str(qts).replace("Z", "+00:00"))
+                now = _dt.utcnow()
+                if (ts_dt - now).total_seconds() > 300:
+                    bad_reasons.append("future_timestamp")
+                if (now - ts_dt).total_seconds() > 86400 * 3:
+                    bad_reasons.append("ancient_timestamp")
+            except:
+                pass
+        if qvol < 0:
+            bad_reasons.append("negative_volume")
+        if bad_reasons:
+            logger.warning(f"[DATA_QUALITY] {symbol} rejected: {bad_reasons} raw={data}")
+            # Still allow buffer for resilience in early dev, but mark & don't compute signal on bad
+            data["_quality_bad"] = bad_reasons
+            # record for status
+            if symbol not in _QUALITY_BAD:
+                _QUALITY_BAD[symbol] = []
+            _QUALITY_BAD[symbol].append((datetime.utcnow().isoformat(), bad_reasons))
+            if len(_QUALITY_BAD[symbol]) > _MAX_QUALITY_BAD:
+                _QUALITY_BAD[symbol] = _QUALITY_BAD[symbol][- _MAX_QUALITY_BAD :]
+    except Exception as _qe:
+        logger.debug(f"quality gate error (non fatal): {_qe}")
+
+    # Log live data (with correlation id)
+    logger.info(f"[LIVE DATA {req_id}] {symbol} {timeframe} | Close={data.get('close')} | Bid={data.get('bid')} | Ask={data.get('ask')} | Volume={data.get('volume')}")
 
     # 1. Update live buffer immediately (this is the fresh data we will use for decisions)
     live_buffer.add_market_data(symbol, data)
 
     # 2. Try to compute real-time signal using recent live data (more aggressive for live path)
     signal_result = None
-    try:
-        recent_df = live_buffer.get_recent_df_for_structure(symbol, limit=200)
-        if recent_df is not None and len(recent_df) >= 6:
-            # Use a very lenient min_candles for the live path so structure can start forming earlier
-            ms = compute_structure(recent_df, symbol=symbol, timeframe="M1", min_candles=6)
-            signal_result = get_structure_signal(ms, spread=data.get("spread", 0.0))
-    except Exception as e:
-        logger.error(f"Real-time structure processing failed for {symbol}: {e}")
+    if data.get("_quality_bad"):
+        logger.info(f"[DATA_QUALITY] skipping realtime structure for {symbol} due to {data['_quality_bad']}")
+    else:
+        try:
+            recent_df = live_buffer.get_recent_df_for_structure(symbol, limit=200)
+            if recent_df is not None and len(recent_df) >= 6:
+                # Use a very lenient min_candles for the live path so structure can start forming earlier
+                ms = compute_structure(recent_df, symbol=symbol, timeframe="M1", min_candles=6)
+                signal_result = get_structure_signal(ms, spread=data.get("spread", 0.0))
+        except Exception as e:
+            logger.error(f"Real-time structure processing failed for {symbol}: {e}")
 
     # === HARD RiskManager veto layer for realtime path (same as /signal) ===
     # Equity comes directly from EA payload every tick. Non-bypassable.
@@ -114,69 +213,67 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
         pass
 
     if signal_result:
+        # Apply kill switch / system mode override (non-bypassable)
+        signal_result = _apply_system_mode_to_signal(signal_result, symbol)
         response["signal"] = signal_result
         # Pretty print the real-time signal we just computed from live data
         print(f"\n[REALTIME SIGNAL from POST] {symbol} {timeframe}", json.dumps(signal_result, indent=2, default=str))
         # Promote key risk fields to top-level response for EA convenience (in addition to inside signal)
-        for k in ("risk_pct", "risk_streak", "risk_veto", "validated_stop"):
+        for k in ("risk_pct", "risk_streak", "risk_veto", "validated_stop", "system_mode", "action"):
             if k in signal_result:
                 response[k] = signal_result[k]
     else:
-        response["signal"] = {
+        base_hold = {
             "signal": "HOLD",
             "confidence": 0.0,
             "rationale": "Insufficient live bars for structure analysis yet."
         }
-        print(f"\n[REALTIME SIGNAL from POST] {symbol} {timeframe} → HOLD (not enough live bars yet)")
+        base_hold = _apply_system_mode_to_signal(base_hold, symbol)
+        response["signal"] = base_hold
+        print(f"\n[REALTIME SIGNAL from POST] {symbol} {timeframe} → {base_hold.get('signal')} (not enough live bars yet)")
 
-    # 4. Store to DB in background (after we already responded to MT5)
+    # 4. Store to DB in background (after we already responded to MT5) - now using pool
     def _persist_to_db():
+        from app.db import db_cursor
         try:
-            try:
-                conn.rollback()
-            except:
-                pass
-            ts_val = data.get("timestamp")
-            if ts_val:
-                insert_query = """
-                INSERT INTO market_data
-                (symbol, timeframe, timestamp, open, high, low, close, tick_volume, spread)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """
-                cursor.execute(insert_query, (
-                    symbol,
-                    timeframe,
-                    ts_val,
-                    data.get("open"),
-                    data.get("high"),
-                    data.get("low"),
-                    data.get("close"),
-                    data.get("volume"),
-                    data.get("spread", 0)
-                ))
-            else:
-                insert_query = """
-                INSERT INTO market_data
-                (symbol, timeframe, timestamp, open, high, low, close, tick_volume, spread)
-                VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s)
-                """
-                cursor.execute(insert_query, (
-                    symbol,
-                    timeframe,
-                    data.get("open"),
-                    data.get("high"),
-                    data.get("low"),
-                    data.get("close"),
-                    data.get("volume"),
-                    data.get("spread", 0)
-                ))
-            conn.commit()
+            with db_cursor() as (c, cur):
+                ts_val = data.get("timestamp")
+                if ts_val:
+                    insert_query = """
+                    INSERT INTO market_data
+                    (symbol, timeframe, timestamp, open, high, low, close, tick_volume, spread)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    cur.execute(insert_query, (
+                        symbol,
+                        timeframe,
+                        ts_val,
+                        data.get("open"),
+                        data.get("high"),
+                        data.get("low"),
+                        data.get("close"),
+                        data.get("volume"),
+                        data.get("spread", 0)
+                    ))
+                else:
+                    insert_query = """
+                    INSERT INTO market_data
+                    (symbol, timeframe, timestamp, open, high, low, close, tick_volume, spread)
+                    VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s)
+                    """
+                    cur.execute(insert_query, (
+                        symbol,
+                        timeframe,
+                        data.get("open"),
+                        data.get("high"),
+                        data.get("low"),
+                        data.get("close"),
+                        data.get("volume"),
+                        data.get("spread", 0)
+                    ))
+                c.commit()
         except Exception as e:
             logger.error(f"Background DB insert failed for {symbol}: {e}")
-            try:
-                conn.rollback()
-            except:
-                pass
 
     background_tasks.add_task(_persist_to_db)
 
@@ -228,8 +325,8 @@ def report_trade(trade: dict):
 
 @app.get("/api/open-trades")
 def api_open_trades(symbol: str = None, limit: int = 50):
-    """Current open trades for dashboard live view."""
-    from app.db import ensure_live_tables
+    """Current open trades for dashboard live view. (now pooled)"""
+    from app.db import ensure_live_tables, db_cursor
     ensure_live_tables()
     try:
         sym = normalize_symbol(symbol) if symbol else None
@@ -241,33 +338,27 @@ def api_open_trades(symbol: str = None, limit: int = 50):
         if sym:
             sym_clause, sym_params = symbol_sql_match(sym)
             q = f"{base} AND {sym_clause} ORDER BY ts DESC LIMIT %s"
-            try:
-                conn.rollback()
-            except:
-                pass
-            cursor.execute(q, sym_params + (limit,))
+            params = sym_params + (limit,)
         else:
             q = base + " ORDER BY ts DESC LIMIT %s"
+            params = (limit,)
+        with db_cursor() as (c, cur):
             try:
-                conn.rollback()
+                c.rollback()
             except:
                 pass
-            cursor.execute(q, (limit,))
-        rows = cursor.fetchall()
-        cols = [desc[0] for desc in cursor.description]
-        out = []
-        for row in rows:
-            d = dict(zip(cols, row))
-            if d.get("ts") and hasattr(d.get("ts"), "isoformat"):
-                d["ts"] = d["ts"].isoformat()
-            out.append(d)
-        return out
+            cur.execute(q, params)
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+            out = []
+            for row in rows:
+                d = dict(zip(cols, row))
+                if d.get("ts") and hasattr(d.get("ts"), "isoformat"):
+                    d["ts"] = d["ts"].isoformat()
+                out.append(d)
+            return out
     except Exception as e:
         logger.error(f"open-trades err: {e}")
-        try:
-            conn.rollback()
-        except:
-            pass
         return []
 
 
@@ -288,9 +379,10 @@ def api_health():
     return {
         "status": "ok",
         "version": "post-fix-june2026",
+        "mode": get_system_mode(),
         "tracked": syms,
         "buffers_ok": buffers_ok,
-        "note": "All High/Med findings addressed: markers gone, timestamps+closed bars, robust EA JSON+close reporting, DB schema+pool, dashboard with SL/TP live tracking, risk/EA plumbing ready."
+        "note": "All High/Med findings addressed: markers gone, timestamps+closed bars, robust EA JSON+close reporting, DB schema+pool, dashboard with SL/TP live tracking, risk/EA plumbing ready. Use /api/control for kill/pause."
     }
 
 @app.get("/api/system-status")
@@ -301,11 +393,34 @@ def api_system_status():
         "status": "running",
         "version": "post-fix",
         "timestamp": datetime.utcnow().isoformat(),
+        "mode": get_system_mode(),
         "buffer_max_m1": getattr(live_buffer, 'max_bars', 10080),
         "buffer_max_m5": getattr(live_buffer, 'max_m5_bars', 2016),
         "symbols_tracked": syms,
         "buffers": buffers,
+        "recent_data_quality_issues": {s: _QUALITY_BAD.get(s, []) for s in syms},
     }
+
+@app.get("/metrics")
+def metrics():
+    """Basic prometheus-style text metrics (no external deps)."""
+    lines = []
+    mode = get_system_mode()
+    lines.append(f'capri_system_mode{{mode="{mode}"}} 1')
+    try:
+        syms = live_buffer.list_tracked_symbols()
+        for s in syms:
+            st = live_buffer.get_buffer_status(s)
+            lines.append(f'capri_buffer_bars{{symbol="{s}"}} {st.get("bars_in_buffer", 0)}')
+            lines.append(f'capri_buffer_m5_bars{{symbol="{s}"}} {st.get("m5_bars_in_buffer", 0)}')
+    except:
+        pass
+    # quality issues count
+    for s, bads in list(_QUALITY_BAD.items())[:10]:
+        lines.append(f'capri_data_quality_bad_count{{symbol="{s}"}} {len(bads)}')
+    # simple health
+    lines.append(f'capri_up 1')
+    return "\n".join(lines) + "\n"
 
 @app.get("/api/current-structure/{symbol}")
 def api_current_structure(symbol: str):
@@ -334,7 +449,7 @@ def api_current_structure(symbol: str):
 
 @app.get("/api/recent-signals")
 def api_recent_signals(symbol: str = None, limit: int = 100):
-    from app.db import ensure_live_tables
+    from app.db import ensure_live_tables, db_cursor
     ensure_live_tables()
     try:
         sym = normalize_symbol(symbol) if symbol else None
@@ -348,11 +463,7 @@ def api_recent_signals(symbol: str = None, limit: int = 100):
                 ORDER BY ts DESC
                 LIMIT %s
             """
-            try:
-                conn.rollback()
-            except:
-                pass
-            cursor.execute(q, sym_params + (limit,))
+            params = sym_params + (limit,)
         else:
             q = """
                 SELECT ts, symbol, timeframe, signal, score, confidence, setup, rationale,
@@ -361,46 +472,44 @@ def api_recent_signals(symbol: str = None, limit: int = 100):
                 ORDER BY ts DESC
                 LIMIT %s
             """
+            params = (limit,)
+        with db_cursor() as (c, cur):
             try:
-                conn.rollback()
+                c.rollback()
             except:
                 pass
-            cursor.execute(q, (limit,))
-        rows = cursor.fetchall()
-        cols = [desc[0] for desc in cursor.description]
-        results = []
-        for row in rows:
-            d = dict(zip(cols, row))
-            if d.get("ts"):
-                d["ts"] = d["ts"].isoformat() if hasattr(d["ts"], "isoformat") else str(d["ts"])
-            raw = d.pop("raw_response", None) or {}
-            if isinstance(raw, str):
-                try:
-                    raw = json.loads(raw)
-                except:
-                    raw = {}
-            if isinstance(raw, dict):
-                ctx = raw.get("contextual_scores") or {}
-                d["total_confluence"] = ctx.get("total", raw.get("total_confluence", 0))
-                d["contextual_scores"] = ctx
-            else:
-                d["total_confluence"] = 0
-            for col in ("score", "confidence", "current_price", "total_confluence"):
-                if d.get(col) is None:
-                    d[col] = 0
-            results.append(d)
-        return results
+            cur.execute(q, params)
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+            results = []
+            for row in rows:
+                d = dict(zip(cols, row))
+                if d.get("ts"):
+                    d["ts"] = d["ts"].isoformat() if hasattr(d["ts"], "isoformat") else str(d["ts"])
+                raw = d.pop("raw_response", None) or {}
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except:
+                        raw = {}
+                if isinstance(raw, dict):
+                    ctx = raw.get("contextual_scores") or {}
+                    d["total_confluence"] = ctx.get("total", raw.get("total_confluence", 0))
+                    d["contextual_scores"] = ctx
+                else:
+                    d["total_confluence"] = 0
+                for col in ("score", "confidence", "current_price", "total_confluence"):
+                    if d.get(col) is None:
+                        d[col] = 0
+                results.append(d)
+            return results
     except Exception as e:
         print(f"api_recent_signals error: {e}")
-        try:
-            conn.rollback()
-        except:
-            pass
         return []
 
 @app.get("/api/trades")
 def api_trades(symbol: str = None, limit: int = 200):
-    from app.db import ensure_live_tables
+    from app.db import ensure_live_tables, db_cursor
     ensure_live_tables()
     try:
         sym = normalize_symbol(symbol) if symbol else None
@@ -414,11 +523,7 @@ def api_trades(symbol: str = None, limit: int = 200):
                 ORDER BY ts DESC
                 LIMIT %s
             """
-            try:
-                conn.rollback()
-            except:
-                pass
-            cursor.execute(q, sym_params + (limit,))
+            params = sym_params + (limit,)
         else:
             q = """
                 SELECT ts, symbol, direction, entry_price, stop_loss, tp1, tp2,
@@ -427,24 +532,84 @@ def api_trades(symbol: str = None, limit: int = 200):
                 ORDER BY ts DESC
                 LIMIT %s
             """
+            params = (limit,)
+        with db_cursor() as (c, cur):
             try:
-                conn.rollback()
+                c.rollback()
             except:
                 pass
-            cursor.execute(q, (limit,))
-        rows = cursor.fetchall()
-        cols = [desc[0] for desc in cursor.description]
-        out = []
-        for row in rows:
-            d = dict(zip(cols, row))
-            if d.get("ts") and hasattr(d["ts"], "isoformat"):
-                d["ts"] = d["ts"].isoformat()
-            out.append(d)
-        return out
+            cur.execute(q, params)
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+            out = []
+            for row in rows:
+                d = dict(zip(cols, row))
+                if d.get("ts") and hasattr(d["ts"], "isoformat"):
+                    d["ts"] = d["ts"].isoformat()
+                out.append(d)
+            return out
     except Exception as e:
         print(f"api_trades error: {e}")
-        try:
-            conn.rollback()
-        except:
-            pass
         return []
+
+
+# =============================================================================
+# KILL SWITCH / CONTROL ENDPOINTS + MODE AWARENESS (Phase 2)
+# =============================================================================
+
+@app.get("/api/system-mode")
+def api_system_mode():
+    """Current trading mode for UI/EA. Modes: trading | paused | flatten"""
+    return {
+        "mode": get_system_mode(),
+        "timestamp": datetime.utcnow().isoformat(),
+        "note": "trading=normal, paused=signals HOLD only, flatten=close all positions + HOLD"
+    }
+
+@app.post("/api/control")
+def api_control(payload: dict):
+    """
+    Control endpoint for kill switch etc.
+    payload: {"action": "flatten_all" | "pause" | "resume" | "set_mode"}
+    If set_mode, include "mode": "trading"|"paused"|"flatten"
+    """
+    action = (payload.get("action") or "").lower()
+    new_mode = payload.get("mode")
+
+    if action == "flatten_all" or new_mode == "flatten":
+        set_system_mode("flatten")
+        logger.warning("[CONTROL] FLATTEN_ALL requested - all positions should be closed by EA")
+        return {"status": "ok", "mode": "flatten", "message": "FLATTEN signal active. EA should close everything."}
+    elif action == "pause" or new_mode == "paused":
+        set_system_mode("paused")
+        logger.warning("[CONTROL] PAUSE requested")
+        return {"status": "ok", "mode": "paused", "message": "Trading paused. Signals will be HOLD."}
+    elif action == "resume" or new_mode == "trading":
+        set_system_mode("trading")
+        logger.info("[CONTROL] RESUME to trading")
+        return {"status": "ok", "mode": "trading", "message": "Normal trading resumed."}
+    elif action == "set_mode" and new_mode in ("trading", "paused", "flatten"):
+        set_system_mode(new_mode)
+        return {"status": "ok", "mode": new_mode}
+    else:
+        return {"status": "error", "message": "Unknown action. Use flatten_all, pause, resume, or set_mode + mode."}
+
+def _apply_system_mode_to_signal(signal_dict: dict, symbol: str = "") -> dict:
+    """If system not in trading mode, override signal to HOLD or special FLATTEN."""
+    mode = get_system_mode()
+    if mode == "trading":
+        return signal_dict
+    out = dict(signal_dict) if isinstance(signal_dict, dict) else {"signal": "HOLD"}
+    if mode == "flatten":
+        out["signal"] = "FLATTEN"
+        out["rationale"] = (out.get("rationale", "") + " | SYSTEM FLATTEN: close all positions immediately.").strip()
+        out["action"] = "flatten_all"
+    else:  # paused
+        out["signal"] = "HOLD"
+        out["rationale"] = (out.get("rationale", "") + " | SYSTEM PAUSED via kill switch / control.").strip()
+    out["system_mode"] = mode
+    logger.warning(f"[SYSTEM MODE] {symbol} overridden to {out['signal']} (mode={mode})")
+    return out
+
+# Enhance existing system-status with mode
+# (we'll monkey a bit at end of function by editing the return in place if needed; for now new calls will see it)

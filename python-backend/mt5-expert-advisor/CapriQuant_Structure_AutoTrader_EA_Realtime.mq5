@@ -232,6 +232,24 @@ void ProcessSignalResponse(string json)
    // Server can send risk_pct to override the input (never assign to input var!)
    double server_risk_pct = ExtractJsonDouble(json, "risk_pct");
 
+   // ===== KILL SWITCH / SYSTEM MODE SUPPORT (phase2) =====
+   string sysMode = ExtractJsonString(json, "system_mode");
+   string action  = ExtractJsonString(json, "action");
+   if(sysMode == "flatten" || action == "flatten_all" || signalDir == "FLATTEN")
+   {
+      Print("[CapriQuant] *** KILL SWITCH / FLATTEN received: ", rationale);
+      CloseAllPositions("kill_switch");
+      // Report mode for dashboard
+      SendTradeReport("SYSTEM", 0, 0, 0, 0, "flatten", 0, "system", 0, "flatten");
+      return;
+   }
+   if(sysMode == "paused")
+   {
+      Print("[CapriQuant] SYSTEM PAUSED - ignoring signals. ", rationale);
+      return;
+   }
+   // =====================================================
+
    if(signalDir == "HOLD")
    {
       int candles = (int)ExtractJsonDouble(json, "candles_available");
@@ -365,6 +383,43 @@ bool HasOpenPosition()
       }
    }
    return false;
+}
+
+// Close all positions for this EA (used by kill switch / flatten)
+void CloseAllPositions(string reason = "kill_switch")
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong posTicket = PositionGetTicket(i);
+      if(PositionSelectByTicket(posTicket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == currentSymbol &&
+            PositionGetInteger(POSITION_MAGIC) == Magic)
+         {
+            MqlTradeRequest req = {};
+            MqlTradeResult  res = {};
+            req.action   = TRADE_ACTION_DEAL;
+            req.position = posTicket;
+            req.symbol   = currentSymbol;
+            req.volume   = PositionGetDouble(POSITION_VOLUME);
+            req.type     = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+            req.price    = (req.type == ORDER_TYPE_SELL) ? SymbolInfoDouble(currentSymbol, SYMBOL_BID) : SymbolInfoDouble(currentSymbol, SYMBOL_ASK);
+            req.deviation = 30;
+            req.magic    = Magic;
+            req.comment  = "CapriQuant-" + reason;
+            if(OrderSend(req, res))
+            {
+               Print("[CapriQuant] KILL/CLOSE executed ticket=", posTicket, " reason=", reason);
+               // Report as closed with kill reason
+               SendTradeReport("CLOSE", req.volume, 0, 0, 0, reason, posTicket, "closed", req.price, reason);
+            }
+            else
+            {
+               Print("[CapriQuant] Close FAILED for ", posTicket, " ret=", res.retcode);
+            }
+         }
+      }
+   }
 }
 
 // CalculateLots now accepts optional riskPct so we can use server value without touching the input
