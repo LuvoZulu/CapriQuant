@@ -152,11 +152,14 @@ It will probably never be a "Renaissance-style quant fund" (different philosophy
 **2026-06 UPDATE: Recommended immediate next actions (the 4 P0) HAVE BEEN EXECUTED.**
 - 1-4 as before (Risk hard layer, honest backtest, tests, secrets+CI).
 
-**Phase 2 (Production Hardening...) STARTED & SIGNIFICANT PROGRESS:**
+**Phase 2 (Production Hardening...) STARTED & MAJOR BEST-FOR-SYSTEM PROGRESS:**
 See NEXT_PHASE.md for full outline + current status.
-Executed: Kill switch (full E2E: backend control+mode+override, EA close, prominent UI red buttons + status, persisted), DB pool adoption (context helper + refactors in main/signals for apis/queries/persist), Data quality gate (ingest validate + status exposure + skip on bad), Structured/metrics (/metrics + ids), EA canonical progress (kill added to both main variants, one marked recommended).
-Remaining this phase: post-entry mgmt, dashboard curve/attr, CRT wire (high value).
+Executed (prioritized for max real impact on performance + safety):
+- Kill switch full E2E, pool adoption, data quality, structured/metrics, EA canonical.
+- **Post-entry management** (the best addition for actual trading results): BE on mitigation, trail on swings, early close on opposing CHOCH; full E2E backend compute + EA apply + UI display.
+- **CRT fully restored + wired**: analyzer + integrated into evaluate_setups, total confluence, setups/confluences, scores, backtest, UI.
+- Dashboard equity curve (cum R) + management suggestions shown (clean append).
 
-All changes committed where possible; tests green; no breakage to prior UI/tracking/risk.
+All changes committed; full test suite + imports verified green; no breakage to prior flows. The system is now significantly closer to world-class (smart full lifecycle + requested CRT + visibility + hardened ops).
 
 Would you like a prioritized implementation plan + code sketches for the top gaps (e.g., full RiskManager integration first)? Or focus on one area?

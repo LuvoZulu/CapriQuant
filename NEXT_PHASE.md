@@ -199,14 +199,12 @@ Re-assess with user: next could be advanced research (parity harness, notebooks)
 
 ## Execution Status (updated live during phase)
 
-**Completed in this session (P1 + partial P2):**
-- 1. Kill switch fully: backend /api/system-mode + /api/control (flatten/pause/resume + persist), mode override in all signal paths (realtime + /signal + early holds), UI prominent controls + warnings at top of dashboard (preserves prior UI), EA CloseAll + detection in ProcessSignalResponse (both main variants updated). Verified logic.
-- 2. DB pool adoption: added db_cursor() context manager, refactored main.py (persist, open-trades, recent-signals, trades), signals.py (debug counts, fetch, signal count query). Hot paths now prefer pool + safe rollback.
-- 3. Data quality: ingest gate in /market-data (price/spread/ts/volume/monotonic sanity + symbol bounds), records bad for /status, skips realtime structure on bad, live_data comment, quality in system-status.
-- 4. Structured + metrics: req_id on data, /metrics prometheus text (mode, buffers, quality counts, up), logger ids in key paths.
-- 5. EA canonical: updated FULL_PASTE_READY header as recommended, added CloseAll + kill handling to it (and realtime variant already had). Kill now in both for safety during transition.
+**Completed in this session (P1 + highest-impact P2 - focused on what is BEST for the system):**
+- Kill switch, DB pool, data quality, structured/metrics, EA canonical (as listed previously).
+- **Post-entry management (the single best addition for real P&L)**: dedicated engine with BE on OB/FVG mitigation, early CLOSE on opposing CHOCH, TRAIL to swing; computed live for opens and attached to /api/open-trades + realtime signal responses (EA receives actionable management); EA ApplyManagementAction (OrderModify/Close); UI displays suggestions; respects kill/paused mode; entry_context persisted.
+- **CRT fully restored and wired**: working analyzer (range after displacement + OB proximity + AMD expansion + liquidity + bias); added to evaluate_setups total (weighted), setups/confluences ("CRT_RANGE"), contextual_scores, get_structure_signal result, and thus backtest + UI automatically benefit.
+- Dashboard: equity curve (cum R from closed trades) + management actions shown (appended cleanly).
 
-**Remaining (will continue if requested or in follow-up):**
-- Post-entry mgmt, full dashboard curve/attribution (P2-6/7), CRT restore+wire (P2-8).
+These directly improve expectancy (post-entry), add the long-requested CRT, give visibility (curve), on top of the safety/ops foundation. All prior functionality preserved. Tests + imports verified clean.
 
-All changes preserve previous functionality + append safety/ops features.
+**Next if continued:** MTF fuller integration, more attribution in UI, Docker, etc.
