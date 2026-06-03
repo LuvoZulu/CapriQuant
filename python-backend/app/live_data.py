@@ -1,62 +1,125 @@
 """
-Real-time Live Data Buffer with proper M1 bar aggregation.
+Live Data Buffer for real-time TICK to M1 aggregation (simpler updating logic).
 
-This version aggregates incoming TICK data into clean M1 bars so the
-structure engine can properly detect swings, Order Blocks, BOS/CHOCH, etc.
-from recent live market movement instead of stale DB data.
+Supports the real-time POST /market-data path.
+Buffer size 10080 M1 bars.
+The last entry in the buffer for a symbol is always the current forming minute and gets updated live on every call within the minute.
+This makes the buffer (and debug/UI) show data immediately and the numbers update on every incoming payload.
 """
 
 from collections import deque
-from typing import Dict, Optional, Deque
+from typing import Dict, Optional, Deque, Any, List
 import pandas as pd
 from datetime import datetime, timezone
 
-# Per-symbol buffer of completed M1 bars + the current forming bar
-# Each entry: {'timestamp': datetime, 'open': float, 'high': float, 'low': float, 'close': float, 'volume': float}
+from app.utils.symbols import normalize_symbol, symbol_variants
+
+# Per-symbol buffer of M1 bars (last one is the current forming minute, updated live)
 LIVE_BARS: Dict[str, Deque[dict]] = {}
 
-# How many completed M1 bars to keep per symbol (enough for good swing detection)
-MAX_COMPLETED_BARS = 700
+# Real per-symbol tick counters (for debug visibility)
+TICK_STATS: Dict[str, int] = {}
+
+# 10080 M1 bars (~1 week: 7 * 24 * 60)
+MAX_COMPLETED_BARS = 10080
+# 2016 M5 bars (~1 week: 7 * 24 * 12) — derived from M1, tracked for UI/engine
+MAX_M5_BARS = MAX_COMPLETED_BARS // 5
 
 
-def _floor_to_minute(ts: datetime) -> datetime:
-    """Floor a timestamp to the start of its minute."""
+def to_naive_utc(ts) -> datetime:
+    """
+    Normalize any timestamp to naive UTC (no tzinfo).
+    Prevents pandas sort errors when mixing DB backfill + live ticks.
+    """
+    if ts is None:
+        return datetime.utcnow()
+    if isinstance(ts, str):
+        ts = pd.to_datetime(ts, utc=True)
+    if isinstance(ts, pd.Timestamp):
+        ts = ts.to_pydatetime()
+    if isinstance(ts, datetime) and ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    elif isinstance(ts, datetime):
+        pass
+    else:
+        ts = pd.to_datetime(ts, utc=True).to_pydatetime()
+        if ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
+    return ts
+
+
+def _floor_to_minute(ts) -> datetime:
+    """Floor a timestamp to the start of its minute (naive UTC)."""
+    ts = to_naive_utc(ts)
     return ts.replace(second=0, microsecond=0)
 
 
-def update_live_bar(symbol: str, bar: dict):
-    """
-    Feed new market data (from TICK or bar updates) into the live buffer.
+def _normalize_buffer_timestamps(symbol: str) -> None:
+    """Ensure every bar in a symbol buffer uses naive UTC timestamps."""
+    symbol = normalize_symbol(symbol)
+    if symbol not in LIVE_BARS:
+        return
+    for bar in LIVE_BARS[symbol]:
+        bar["timestamp"] = to_naive_utc(bar.get("timestamp"))
 
-    This function aggregates data into proper M1 bars.
+
+def normalize_all_buffers() -> None:
+    for sym in list(LIVE_BARS.keys()):
+        _normalize_buffer_timestamps(sym)
+
+
+def _merge_alias_buffers(canonical: str) -> None:
+    """Merge legacy buffer keys (e.g. XAUUSDM) into canonical XAUUSD."""
+    canonical = normalize_symbol(canonical)
+    if canonical in LIVE_BARS:
+        return
+    for alias in symbol_variants(canonical):
+        if alias != canonical and alias in LIVE_BARS and LIVE_BARS[alias]:
+            LIVE_BARS[canonical] = LIVE_BARS.pop(alias)
+            TICK_STATS[canonical] = TICK_STATS.get(alias, 0)
+            TICK_STATS.pop(alias, None)
+            return
+
+
+def _resolve_buffer_key(symbol: str) -> str:
+    canonical = normalize_symbol(symbol)
+    _merge_alias_buffers(canonical)
+    if canonical in LIVE_BARS and LIVE_BARS[canonical]:
+        return canonical
+    for alias in symbol_variants(canonical):
+        if alias in LIVE_BARS and LIVE_BARS[alias]:
+            if alias != canonical:
+                LIVE_BARS[canonical] = LIVE_BARS.pop(alias)
+            return canonical
+    return canonical
+
+
+def add_market_data(symbol: str, data: dict) -> None:
+    """
+    Feed new market data (from TICK payloads) into the live buffer.
+    This function aggregates into per-minute bars.
+    The last bar for the symbol is the current minute and is updated in place on every call within the minute.
     Call this on every incoming payload from the EA.
     """
-    symbol = symbol.upper()
+    symbol = _resolve_buffer_key(symbol)
 
     if symbol not in LIVE_BARS:
         LIVE_BARS[symbol] = deque(maxlen=MAX_COMPLETED_BARS + 1)
 
+    TICK_STATS[symbol] = TICK_STATS.get(symbol, 0) + 1
+
     buffer = LIVE_BARS[symbol]
 
-    # Determine the timestamp of this update
-    ts_raw = bar.get("timestamp")
-    if ts_raw is None:
-        ts = datetime.now(timezone.utc)
-    elif isinstance(ts_raw, str):
-        try:
-            ts = pd.to_datetime(ts_raw).to_pydatetime()
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-        except:
-            ts = datetime.now(timezone.utc)
-    else:
-        ts = ts_raw
+    ts_raw = data.get("timestamp")
+    ts = to_naive_utc(ts_raw) if ts_raw is not None else datetime.utcnow()
 
-    close = float(bar.get("close", 0))
-    open_ = float(bar.get("open", close))
-    high = float(bar.get("high", close))
-    low = float(bar.get("low", close))
-    volume = float(bar.get("volume", 0))
+    # Use the M1 bar data sent by the EA (open/high/low/close/volume for current minute)
+    # or fall back to the tick price
+    close = float(data.get("close", 0))
+    open_ = float(data.get("open", close))
+    high = float(data.get("high", close))
+    low = float(data.get("low", close))
+    volume = float(data.get("volume", 0))
 
     bar_minute = _floor_to_minute(ts)
 
@@ -73,16 +136,16 @@ def update_live_bar(symbol: str, bar: dict):
         return
 
     last_bar = buffer[-1]
+    last_minute = _floor_to_minute(last_bar["timestamp"])
 
-    if last_bar["timestamp"] == bar_minute:
-        # Still inside the same minute → update the current forming bar
+    if last_minute == bar_minute:
+        # Still inside the same minute → update the current forming bar live
         last_bar["high"] = max(last_bar["high"], high)
         last_bar["low"] = min(last_bar["low"], low)
         last_bar["close"] = close
         last_bar["volume"] += volume
     else:
-        # New minute started → the previous bar is now complete.
-        # Append the new forming bar.
+        # New minute started → append a new bar entry for the new minute (will be updated live)
         buffer.append({
             "timestamp": bar_minute,
             "open": open_,
@@ -93,30 +156,60 @@ def update_live_bar(symbol: str, bar: dict):
         })
 
 
-def get_recent_df(symbol: str, min_bars: int = 15) -> Optional[pd.DataFrame]:
+def resample_ohlcv(df_m1: pd.DataFrame, minutes: int = 5) -> pd.DataFrame:
     """
-    Returns a DataFrame of recent M1 bars (completed + current forming)
-    ready to be fed into compute_market_structure.
+    Resample M1 OHLCV buffer into M5, M15, etc. for multi-timeframe structure analysis.
+    """
+    if df_m1 is None or df_m1.empty:
+        return pd.DataFrame()
 
-    This is the main function the real-time signal logic should use.
+    df = df_m1.copy()
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"].apply(to_naive_utc), utc=False
+    )
+    df = df.set_index("timestamp").sort_index()
+
+    rule = f"{minutes}min"
+    resampled = df.resample(rule, label="left", closed="left").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).dropna(subset=["close"])
+
+    resampled = resampled.reset_index()
+    return resampled
+
+
+def get_recent_df(symbol: str, limit: Optional[int] = None, min_bars: Optional[int] = None) -> Optional[pd.DataFrame]:
     """
-    symbol = symbol.upper()
+    Returns a DataFrame of recent M1 bars (including the current forming minute as the last row).
+    Ready to be fed into compute_structure.
+    Accepts limit or legacy min_bars kwarg.
+    """
+    symbol = _resolve_buffer_key(symbol)
     if symbol not in LIVE_BARS:
         return None
 
     buffer = LIVE_BARS[symbol]
-    if len(buffer) < min_bars:
+    if len(buffer) < 1:
         return None
 
-    df = pd.DataFrame(list(buffer))
+    bars = list(buffer)
+    eff_limit = limit if limit is not None else min_bars
+    if eff_limit:
+        bars = bars[-eff_limit:]
+
+    df = pd.DataFrame(bars)
+    df["timestamp"] = df["timestamp"].apply(to_naive_utc)
     df = df.sort_values("timestamp").reset_index(drop=True)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
     return df
 
 
 def get_latest_price(symbol: str) -> Optional[dict]:
-    """Returns the most recent close + timestamp from the live buffer."""
-    symbol = symbol.upper()
+    """Returns the most recent close + timestamp from the live buffer (the current forming bar)."""
+    symbol = _resolve_buffer_key(symbol)
     if symbol not in LIVE_BARS or not LIVE_BARS[symbol]:
         return None
 
@@ -130,9 +223,136 @@ def get_latest_price(symbol: str) -> Optional[dict]:
 
 
 def get_buffer_length(symbol: str) -> int:
-    """Debug helper."""
-    symbol = symbol.upper()
+    """Debug helper: number of bars (minutes) seen for the symbol."""
+    symbol = _resolve_buffer_key(symbol)
     return len(LIVE_BARS.get(symbol, []))
+
+
+def get_m5_bar_count(symbol: str) -> int:
+    """How many M5 candles are available from the current M1 rolling buffer."""
+    df_m1 = get_recent_df(symbol)
+    if df_m1 is None or len(df_m1) < 2:
+        return 0
+    df_m5 = resample_ohlcv(df_m1, minutes=5)
+    return len(df_m5)
+
+
+def get_recent_m5_df(symbol: str, limit: Optional[int] = None) -> Optional[pd.DataFrame]:
+    """M5 OHLCV derived from the live M1 buffer (used by MTF structure engine)."""
+    df_m1 = get_recent_df(symbol, limit=MAX_COMPLETED_BARS if limit is None else limit * 5)
+    if df_m1 is None or len(df_m1) < 2:
+        return None
+    df_m5 = resample_ohlcv(df_m1, minutes=5)
+    if df_m5.empty:
+        return None
+    if limit:
+        df_m5 = df_m5.tail(limit)
+    return df_m5.reset_index(drop=True)
+
+
+def get_recent_closed_df(symbol: str, limit: Optional[int] = None) -> Optional[pd.DataFrame]:
+    """
+    Returns recent M1 bars excluding the current forming (last) minute.
+    Strongly recommended for live structure calls to avoid spurious swings, BOS/CHOCH, OBs, FVGs and CRT from the still-updating bar.
+    """
+    df = get_recent_df(symbol, limit)
+    if df is None or len(df) < 2:
+        return df
+    return df.iloc[:-1].reset_index(drop=True)
+
+
+def get_recent_df_for_structure(symbol: str, limit: Optional[int] = None) -> Optional[pd.DataFrame]:
+    """
+    Convenience wrapper for structure analysis:
+    Prefer closed (non-forming) bars. If that would give None or empty, fall back to any recent data.
+    This prevents the pandas "truth value of DataFrame is ambiguous" error when doing `df or fallback`.
+    """
+    df = get_recent_closed_df(symbol, limit)
+    if df is None or (hasattr(df, 'empty') and df.empty):
+        df = get_recent_df(symbol, limit)
+    return df
+
+
+def get_buffer_status(symbol: str) -> Dict[str, Any]:
+    """Debug / UI helper — includes both M1 and derived M5 buffer fill."""
+    symbol = _resolve_buffer_key(symbol)
+    buf = LIVE_BARS.get(symbol, deque())
+    count = len(buf)
+    last = buf[-1] if buf else None
+    m5_count = get_m5_bar_count(symbol)
+    return {
+        "symbol": symbol,
+        "bars_in_buffer": count,
+        "effective_bars": count,
+        "max_bars": MAX_COMPLETED_BARS,
+        "pct_full": round(count / MAX_COMPLETED_BARS * 100, 2) if MAX_COMPLETED_BARS > 0 else 0,
+        "m5_bars_in_buffer": m5_count,
+        "max_m5_bars": MAX_M5_BARS,
+        "m5_pct_full": round(m5_count / MAX_M5_BARS * 100, 2) if MAX_M5_BARS > 0 else 0,
+        "m5_ready": m5_count >= 5,
+        "ticks_received": TICK_STATS.get(symbol, 0),
+        "bars_completed": max(0, count - 1),
+        "forming_bar": last,
+    }
+
+
+def get_all_buffer_lengths() -> dict:
+    """Returns how many bars are currently stored for each symbol (canonical keys)."""
+    out: Dict[str, int] = {}
+    for sym, buf in LIVE_BARS.items():
+        key = normalize_symbol(sym)
+        out[key] = max(out.get(key, 0), len(buf))
+    return out
+
+
+def list_tracked_symbols() -> List[str]:
+    """Canonical symbols that have live buffer data."""
+    return sorted({normalize_symbol(s) for s in LIVE_BARS if LIVE_BARS[s]})
+
+
+def seed_buffer(symbol: str, bars: list, merge: bool = True) -> int:
+    """
+    Load historical M1 bars into the live buffer (startup backfill / disk restore).
+    """
+    symbol = normalize_symbol(symbol)
+    if not bars:
+        return 0
+
+    normalized = []
+    for b in bars:
+        ts = to_naive_utc(b.get("timestamp"))
+        normalized.append({
+            "timestamp": ts,
+            "open": float(b.get("open", 0)),
+            "high": float(b.get("high", 0)),
+            "low": float(b.get("low", 0)),
+            "close": float(b.get("close", 0)),
+            "volume": float(b.get("volume", 0)),
+        })
+
+    normalized.sort(key=lambda x: x["timestamp"])
+    # dedupe by minute
+    deduped = []
+    seen = set()
+    for b in normalized:
+        key = b["timestamp"]
+        if key in seen:
+            deduped[-1] = b
+        else:
+            seen.add(key)
+            deduped.append(b)
+
+    if merge and symbol in LIVE_BARS and LIVE_BARS[symbol]:
+        existing = {b["timestamp"]: b for b in LIVE_BARS[symbol]}
+        for b in deduped:
+            existing[b["timestamp"]] = b
+        merged = sorted(existing.values(), key=lambda x: x["timestamp"])
+        LIVE_BARS[symbol] = deque(merged[-(MAX_COMPLETED_BARS + 1):], maxlen=MAX_COMPLETED_BARS + 1)
+    else:
+        LIVE_BARS[symbol] = deque(deduped[-(MAX_COMPLETED_BARS + 1):], maxlen=MAX_COMPLETED_BARS + 1)
+
+    _normalize_buffer_timestamps(symbol)
+    return len(LIVE_BARS[symbol])
 
 
 def clear_buffer(symbol: str = None):
@@ -143,33 +363,52 @@ def clear_buffer(symbol: str = None):
         LIVE_BARS.clear()
 
 
-def get_all_buffer_lengths() -> dict:
-    """Returns how many bars are currently stored in the live buffer for each symbol."""
-    return {sym: len(buf) for sym, buf in LIVE_BARS.items()}
+# For compatibility with code that expects a singleton object with methods
+class _LiveBufferCompat:
+    def add_market_data(self, symbol: str, data: dict) -> None:
+        add_market_data(symbol, data)
+
+    def get_recent_df(self, symbol: str, limit: Optional[int] = None, min_bars: Optional[int] = None):
+        return get_recent_df(symbol, limit, min_bars)
+
+    def get_recent_bars(self, symbol: str, limit: Optional[int] = None):
+        df = get_recent_df(symbol, limit)
+        if df is None or df.empty:
+            return []
+        return df.to_dict("records")
+
+    def get_buffer_status(self, symbol: str):
+        return get_buffer_status(symbol)
+
+    def get_recent_m5_df(self, symbol: str, limit: Optional[int] = None):
+        return get_recent_m5_df(symbol, limit)
+
+    def get_m5_bar_count(self, symbol: str) -> int:
+        return get_m5_bar_count(symbol)
+
+    def get_recent_closed_df(self, symbol: str, limit: Optional[int] = None):
+        return get_recent_closed_df(symbol, limit)
+
+    def get_recent_df_for_structure(self, symbol: str, limit: Optional[int] = None):
+        return get_recent_df_for_structure(symbol, limit)
+
+    def forming(self):
+        return {}
+
+    @property
+    def buffers(self):
+        return {normalize_symbol(k): v for k, v in LIVE_BARS.items()}
+
+    def list_tracked_symbols(self):
+        return list_tracked_symbols()
+
+    @property
+    def max_bars(self):
+        return MAX_COMPLETED_BARS
+
+    @property
+    def max_m5_bars(self):
+        return MAX_M5_BARS
 
 
-def get_buffer_info(symbol: str) -> dict:
-    """Returns detailed info about the live buffer for one symbol."""
-    symbol = symbol.upper()
-    if symbol not in LIVE_BARS or not LIVE_BARS[symbol]:
-        return {"symbol": symbol, "count": 0, "oldest": None, "newest": None}
-
-    buf = LIVE_BARS[symbol]
-    return {
-        "symbol": symbol,
-        "count": len(buf),
-        "oldest": buf[0]["timestamp"].isoformat() if buf else None,
-        "newest": buf[-1]["timestamp"].isoformat() if buf else None,
-        "latest_close": buf[-1]["close"] if buf else None,
-    }
-
-
-def get_recent_closed_df(symbol: str, limit=None):
-    """
-    Returns recent M1 bars excluding the current forming (last) minute.
-    Strongly recommended for live structure calls (compute_structure, MTF) to avoid spurious swings, BOS/CHOCH, OBs, FVGs and CRT from the still-updating bar.
-    """
-    df = get_recent_df(symbol, limit)
-    if df is None or len(df) < 2:
-        return df
-    return df.iloc[:-1].reset_index(drop=True)
+live_buffer = _LiveBufferCompat()

@@ -1,0 +1,52 @@
+"""
+Basic integration-style test for the structure signal path.
+Uses small synthetic data so it runs fast and deterministically.
+"""
+
+import pandas as pd
+from datetime import datetime, timedelta
+
+from app.features.builder import compute_structure
+from app.engine.confluence import get_structure_signal, evaluate_setups
+
+
+def make_ohlc_df(closes: list[float], start_ts: datetime = None) -> pd.DataFrame:
+    if start_ts is None:
+        start_ts = datetime(2025, 6, 1, 0, 0)
+    rows = []
+    for i, c in enumerate(closes):
+        ts = start_ts + timedelta(minutes=5 * i)
+        o = closes[i-1] if i > 0 else c
+        h = max(o, c) + 0.2
+        l = min(o, c) - 0.2
+        rows.append({"timestamp": ts, "open": o, "high": h, "low": l, "close": c, "volume": 10})
+    return pd.DataFrame(rows)
+
+
+def test_evaluate_setups_and_get_signal_on_trending_data():
+    # Gentle uptrend with a pullback -> should produce bullish bias and possibly a setup
+    closes = [100 + i * 0.8 for i in range(25)] + [120 - i*0.3 for i in range(8)] + [117 + j*0.5 for j in range(12)]
+    df = make_ohlc_df(closes)
+    ms = compute_structure(df, symbol="TEST", timeframe="M5", min_candles=10)
+    assert ms.bias in ("BULLISH", "NEUTRAL")  # trending up
+
+    setups = evaluate_setups(ms)
+    # We don't assert >0 because filters are strict, but it must not crash and return list
+    assert isinstance(setups, list)
+
+    sig = get_structure_signal(ms)
+    assert "signal" in sig
+    assert "market_structure" in sig or "bias" in sig
+    assert sig["engine"] in ("structure_v2_strict", "structure_mtf_precision")
+
+
+def test_mtf_small_buffer_graceful():
+    # Very small data -> should return HOLD "building" style message, no crash
+    closes = [100 + i for i in range(9)]
+    df = make_ohlc_df(closes)
+    # Simulate what get_mtf does for tiny buffers
+    from app.engine.multi_timeframe import get_mtf_structure_signal
+    # We can't easily mock the live_buffer here, so just test that compute + get_structure doesn't explode
+    ms = compute_structure(df, "TEST", "M5", min_candles=5)
+    sig = get_structure_signal(ms)
+    assert sig["signal"] in ("HOLD", "BUY", "SELL")

@@ -168,20 +168,28 @@ def get_mtf_structure_signal(
 
     current_price = float(df_m1_full["close"].iloc[-1])
 
-    # Use closed for analysis
-    df_m1 = live_buffer.get_recent_closed_df(symbol, limit=10080) or (df_m1_full.iloc[:-1].reset_index(drop=True) if len(df_m1_full) > 1 else df_m1_full)
+    # Prefer closed bars for structure (robust against empty DataFrame truth-value issues)
+    df_m1 = live_buffer.get_recent_df_for_structure(symbol, limit=10080)
+    if df_m1 is None or (hasattr(df_m1, 'empty') and df_m1.empty):
+        df_m1 = (df_m1_full.iloc[:-1].reset_index(drop=True) if len(df_m1_full) > 1 else df_m1_full)
 
     df_m5 = live_buffer.get_recent_m5_df(symbol, limit=live_buffer.max_m5_bars)
     if df_m5 is None or df_m5.empty:
         df_m5 = resample_ohlcv(df_m1_full, minutes=5)
     df_m15 = resample_ohlcv(df_m1_full, minutes=15)
 
+    # Use only completed (closed) bars for higher TF structure to avoid noise from forming candle (fixes 0 swings)
+    if len(df_m5) > 1:
+        df_m5 = df_m5.iloc[:-1].reset_index(drop=True)
+    if len(df_m15) > 1:
+        df_m15 = df_m15.iloc[:-1].reset_index(drop=True)
+
     ms_m5 = None
-    if len(df_m5) >= 5:
+    if len(df_m5) >= 3:
         ms_m5 = compute_structure(df_m5, symbol=symbol, timeframe="M5", min_candles=30)
         ms_m5.current_price = current_price
 
-    if len(df_m5) < 5 or len(df_m15) < 4 or ms_m5 is None:
+    if len(df_m5) < 3 or len(df_m15) < 2 or ms_m5 is None:
         return {
             "signal": "HOLD",
             "score": 0.0,

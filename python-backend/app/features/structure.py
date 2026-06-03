@@ -215,7 +215,12 @@ def find_swings(
     This replaces the broken `high.iloc[-20:].max()` approach.
     """
     if len(df) < left + right + 2:
-        return []
+        # for live/small buffers, fall back to minimal confirmation to bootstrap structure detection
+        if len(df) >= 5:
+            left = 1
+            right = 1
+        else:
+            return []
 
     highs = df["high"].values
     lows = df["low"].values
@@ -310,8 +315,8 @@ def detect_structure_breaks(
 
     Returns breaks (most recent last) and current bias.
     """
-    if len(swings) < 3:
-        return [], "NEUTRAL"
+    if len(swings) < 2:
+        return [], "NEUTRAL"  # lowered to allow bias inference with minimal data in live buffers
 
     breaks: List[StructureBreak] = []
     bias: StructureBias = "NEUTRAL"

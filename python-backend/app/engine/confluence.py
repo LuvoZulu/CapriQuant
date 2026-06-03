@@ -14,7 +14,7 @@ Philosophy:
 This is what allows automatic trading without MACD/RSI/EMA soup.
 """
 
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 from dataclasses import dataclass
 from app.features.structure import MarketStructure, OrderBlock
 
@@ -93,6 +93,87 @@ def _nearest_active_ob(ms: MarketStructure, direction: str) -> Optional[OrderBlo
     else:
         bears = [ob for ob in active if ob.ob_type == "BEARISH"]
         return min(bears, key=lambda o: abs(o.low - ms.current_price)) if bears else None
+
+
+def _breathing_stop_and_targets(
+    ms: MarketStructure,
+    direction: str,
+    price: float,
+    atr: float,
+    ob_low: Optional[float] = None,
+    ob_high: Optional[float] = None,
+) -> Tuple[float, float, float]:
+    """
+    Wider structural stops and targets so trades can breathe.
+    Stop: below/above OB + recent swing, minimum ATR cushion.
+    TP: further out (min ~2.5R on TP1).
+    """
+    sym = (ms.symbol or "").upper()
+    is_index = any(x in sym for x in ("US30", "USTEC", "NAS", "DE30", "DAX", "GER", "DJ"))
+    is_oil = any(x in sym for x in ("OIL", "WTI", "BRENT", "UKOIL"))
+    stop_pad = atr * (1.15 if is_index else 1.0 if is_oil else 1.25)
+    min_stop_dist = atr * (1.0 if is_index else 1.1 if is_oil else 1.35)
+
+    swings_low = [s.price for s in ms.swings if s.swing_type == "LOW"][-3:]
+    swings_high = [s.price for s in ms.swings if s.swing_type == "HIGH"][-3:]
+
+    if direction == "BUY":
+        structural = price - min_stop_dist
+        if ob_low is not None:
+            structural = min(structural, ob_low - stop_pad)
+        if swings_low:
+            structural = min(structural, min(swings_low) - atr * 0.25)
+        stop = structural
+        risk = max(price - stop, atr * 0.5)
+        tp1 = price + risk * 3.0
+        tp2 = price + risk * 5.0
+    else:
+        structural = price + min_stop_dist
+        if ob_high is not None:
+            structural = max(structural, ob_high + stop_pad)
+        if swings_high:
+            structural = max(structural, max(swings_high) + atr * 0.25)
+        stop = structural
+        risk = max(stop - price, atr * 0.5)
+        tp1 = price - risk * 3.0
+        tp2 = price - risk * 5.0
+
+    return stop, tp1, tp2
+
+
+def apply_m5_risk_levels(
+    signal: Dict,
+    ms_m5: MarketStructure,
+    entry_price: Optional[float] = None,
+) -> Dict:
+    """
+    Force stop and targets from M5 market structure (wider, not M1 noise).
+    Used by the MTF engine after direction is chosen.
+    """
+    direction = str(signal.get("signal", "HOLD")).upper()
+    if direction not in ("BUY", "SELL"):
+        return signal
+
+    price = float(entry_price or ms_m5.current_price or 0)
+    if price <= 0:
+        return signal
+
+    atr = ms_m5.atr if ms_m5.atr > 0 else max(0.0001, price * 0.0008)
+    ob = _nearest_active_ob(ms_m5, direction)
+    ob_low = ob.low if ob else None
+    ob_high = ob.high if ob else None
+
+    sl, tp1, tp2 = _breathing_stop_and_targets(
+        ms_m5, direction, price, atr, ob_low=ob_low, ob_high=ob_high
+    )
+
+    out = dict(signal)
+    out["stop_suggestion"] = round(sl, 5)
+    out["tp1"] = round(tp1, 5)
+    out["tp2"] = round(tp2, 5)
+    out["risk_timeframe"] = "M5"
+    out["rationale"] = (out.get("rationale") or "") + " | SL/TP from M5 structure"
+    return out
 
 
 def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
