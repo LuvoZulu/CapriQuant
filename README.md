@@ -25,7 +25,13 @@ They were ~90% classic lagging indicators (EMA crosses, vanilla RSI, MACD) with 
 
 **Strong recommendation:** Paper trade the new `?engine=structure` version extensively before using real money. The old system had no validated edge.
 
-## Running the server
+## Running the server (as a Windows Service)
+
+The backend is designed to run as a Windows Service (see "Running the Backend as a Windows Service" section below).
+
+It listens on `http://127.0.0.1:8001` (or 0.0.0.0:8001 inside the service).
+
+For local development you can still run manually:
 
 ```bash
 cd python-backend
@@ -91,3 +97,164 @@ The new system is now dramatically better than the original indicator soup. Whet
 ---
 
 If you want to go back to the old (now deprecated) behavior for any reason, call with `?engine=legacy`.
+
+---
+
+## Running the Backend as a Windows Service (Auto-start, No Manual Launch)
+
+The goal is for the backend (FastAPI + realtime structure engine) to run automatically when you turn on your PC, with **no manual starting**, and only on weekdays.
+
+### Recommended Method: NSSM (Simplest & Most Reliable)
+
+1. **Download NSSM**
+   - Go to https://nssm.cc/download
+   - Download the latest version and extract `nssm.exe` (use the 64-bit version if your Windows is 64-bit).
+   - Put it in an easy location, e.g. `C:\Tools\nssm\nssm.exe`
+
+2. **Open Command Prompt as Administrator**
+
+3. **Install the Service** (easiest: use the new installer helper as Administrator):
+
+   Double-click or run as Admin:
+   ```
+   python-backend\service\install_as_service.bat
+   ```
+
+   Or manually with the wrapper:
+   ```cmd
+   C:\Tools\nssm\nssm.exe install CapriQuantBackend "C:\Users\Kaos\Documents\2026\Programming\CapriQuant\python-backend\service\start_capriquant.bat"
+   ```
+
+4. **Configure the Service** (run these commands):
+
+   ```cmd
+   C:\Tools\nssm\nssm.exe set CapriQuantBackend AppDirectory "C:\Users\Kaos\Documents\2026\Programming\CapriQuant\python-backend"
+   C:\Tools\nssm\nssm.exe set CapriQuantBackend Start SERVICE_AUTO_START
+   C:\Tools\nssm\nssm.exe set CapriQuantBackend AppStdout "C:\Users\Kaos\Documents\2026\Programming\CapriQuant\python-backend\logs\service_stdout.log"
+   C:\Tools\nssm\nssm.exe set CapriQuantBackend AppStderr "C:\Users\Kaos\Documents\2026\Programming\CapriQuant\python-backend\logs\service_stderr.log"
+   ```
+
+   (Create the `logs` folder first if it doesn't exist.)
+
+5. **Start the Service**
+
+   ```cmd
+   C:\Tools\nssm\nssm.exe start CapriQuantBackend
+   ```
+
+   Or open `services.msc`, find "CapriQuantBackend", and start it.
+
+6. **Verify**
+   - The backend should now be running at `http://127.0.0.1:8001`
+   - Your MT5 EA should be able to POST market data and receive realtime signals without you starting anything.
+   - On weekends the service will sleep (logic is inside `service\run_as_windows_service.py`).
+
+**Important Notes:**
+- The weekday-only logic lives in `python-backend/service/run_as_windows_service.py`. On Sat/Sun it sleeps instead of running the server.
+- Make sure the Python interpreter used by the service has all dependencies installed (`fastapi`, `uvicorn`, `psycopg2`, `pandas`, etc.).
+- You can manage the service with `nssm` commands or `services.msc`.
+- To remove the service later: `nssm remove CapriQuantBackend confirm`
+
+### How to Stop the Service
+
+To stop the running CapriQuantBackend service:
+
+**Easiest (recommended):**
+
+Double-click or run as Administrator:
+```
+python-backend\service\stop_service.bat
+```
+
+**Manual methods (as Administrator in Command Prompt):**
+
+Using NSSM (if installed at the usual location):
+```cmd
+C:\Tools\nssm\nssm.exe stop CapriQuantBackend
+```
+
+Using Windows built-in:
+```cmd
+sc stop CapriQuantBackend
+```
+
+**Using the GUI (no admin prompt needed for this step):**
+1. Press `Win + R`, type `services.msc` and press Enter.
+2. Scroll to find **CapriQuantBackend**.
+3. Right-click it → **Stop**.
+
+After stopping, the backend will no longer respond on port 8001. Your MT5 EA will stop receiving signals until you start the service again.
+
+To check status:
+```cmd
+C:\Tools\nssm\nssm.exe status CapriQuantBackend
+```
+or
+```cmd
+sc query CapriQuantBackend
+```
+
+Alternative (pure Python service without NSSM) is commented inside `run_as_windows_service.py` (requires `pip install pywin32` and registration commands).
+
+---
+
+## Running the UI / Visualizer (Streamlit Dashboard)
+
+The UI lets you watch live system progress, buffer status (10080 M1 bars), per-symbol market structure cards, signal build-up history (with charts), and executed trades.
+
+### Steps
+
+1. Open a normal Command Prompt (no admin needed).
+
+2. Install the UI dependencies (only needed once):
+
+   ```bash
+   cd C:\Users\Kaos\Documents\2026\Programming\CapriQuant\python-backend
+   pip install streamlit pandas requests
+   ```
+
+3. Run the dashboard (UI can run on any port, default is 8501):
+
+   ```bash
+   streamlit run ui/dashboard.py --server.address 127.0.0.1
+   ```
+
+   Or simply double-click the helper (recommended):
+
+   ```
+   python-backend\ui\run_ui.bat
+   ```
+
+4. It will open in your browser (e.g. http://127.0.0.1:8501). The dashboard fetches all data from the backend on 8001.
+
+**Pro tip for convenience:** We have already created `python-backend\ui\run_ui.bat` that runs the UI on the default Streamlit port while correctly connecting to the backend on 8001.
+
+You can also create a desktop shortcut pointing to:
+
+```bat
+@echo off
+cd /d "C:\Users\Kaos\Documents\2026\Programming\CapriQuant\python-backend"
+python -m streamlit run ui\dashboard.py --server.address 127.0.0.1
+```
+
+Name it "CapriQuant Visualizer". Double-click whenever you want to open the dashboard. The backend service runs independently.
+
+**Usage Tips:**
+- The backend **Windows service must be running** for the UI to show live data.
+- You can leave the tab open all day — it auto-refreshes.
+- Use the sidebar to control auto-refresh speed and filter by symbol.
+- Close the tab / stop the Streamlit process when you don't want it (the backend service keeps running independently).
+
+This UI is completely optional. The MT5 EA communicates directly with the backend service.
+
+---
+
+## Quick Directory Reference
+
+- Backend code: `python-backend\`
+- Service files (for auto-start): `python-backend\service\`
+- UI/Visualizer: `python-backend\ui\dashboard.py`
+- Main entry: `python-backend\main.py`
+- Logs from EA + signals: `python-backend\logs\`
+
+The system is designed so the **backend service** runs 24/7 on weekdays with zero interaction, while you only open the UI when you want to visually monitor progress, signals forming, and trades taken.
