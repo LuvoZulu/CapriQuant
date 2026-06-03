@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: capriquant
+      POSTGRES_USER: capri
+      POSTGRES_PASSWORD: capri123
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U capri"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./python-backend
+    ports:
+      - "8001:8001"
+    environment:
+      DB_HOST: db
+      DB_NAME: capriquant
+      DB_USER: capri
+      DB_PASSWORD: capri123
+      DB_PORT: 5432
+    depends_on:
+      db:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+    volumes:
+      - ./python-backend:/app
+
+  # Optional: streamlit ui (run separately or add)
+  # ui:
+  #   build: ./python-backend
+  #   ports:
+  #     - "8501:8501"
+  #   command: streamlit run ui/dashboard.py --server.port 8501 --server.address 0.0.0.0
+  #   depends_on:
+  #     - backend
+
+volumes:
+  pgdata:

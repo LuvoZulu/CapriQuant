@@ -20,6 +20,7 @@ from app.features.structure import MarketStructure, OrderBlock
 
 # Import the fully rewritten contextual analyzers
 from app.strategies import amd, fibonacci, price_action, liquidity, crt
+from app.config import get_settings
 from app.utils.signal_logger import log_signal
 
 
@@ -209,10 +210,11 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
         atr=getattr(ms, "atr", 0),
     )
 
+    s = get_settings()
     total_confluence = amd_score + fib_score + pa_score + liq_score + (crt_score * 0.6)
 
-    # Global quality gate - lowered for frequency while still requiring decent confluence
-    if total_confluence < 0.48:
+    # Global quality gate from config
+    if total_confluence < s.min_confluence_for_setup:
         return []
 
     # Simple volatility regime awareness (helps avoid trading in dead/choppy markets)

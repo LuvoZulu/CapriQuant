@@ -152,14 +152,16 @@ It will probably never be a "Renaissance-style quant fund" (different philosophy
 **2026-06 UPDATE: Recommended immediate next actions (the 4 P0) HAVE BEEN EXECUTED.**
 - 1-4 as before (Risk hard layer, honest backtest, tests, secrets+CI).
 
-**Phase 2 (Production Hardening...) STARTED & MAJOR BEST-FOR-SYSTEM PROGRESS:**
+**Phase 2 (Production Hardening...) - ALL BEST NEXT MOVES + FULL NEXT_PHASE COMPLETED:**
 See NEXT_PHASE.md for full outline + current status.
-Executed (prioritized for max real impact on performance + safety):
-- Kill switch full E2E, pool adoption, data quality, structured/metrics, EA canonical.
-- **Post-entry management** (the best addition for actual trading results): BE on mitigation, trail on swings, early close on opposing CHOCH; full E2E backend compute + EA apply + UI display.
-- **CRT fully restored + wired**: analyzer + integrated into evaluate_setups, total confluence, setups/confluences, scores, backtest, UI.
-- Dashboard equity curve (cum R) + management suggestions shown (clean append).
+Executed:
+- Kill switch, pool, data quality, structured/metrics, EA canonical.
+- Post-entry management (BE/trail/early exit - best for real results).
+- CRT full wire.
+- Dashboard curve + attribution + mgmt.
+- MTF as production path.
+- Central config, parity script, Docker basics.
 
-All changes committed; full test suite + imports verified green; no breakage to prior flows. The system is now significantly closer to world-class (smart full lifecycle + requested CRT + visibility + hardened ops).
+All tests green, committed. System now in excellent shape for world-class SMC trading.
 
 Would you like a prioritized implementation plan + code sketches for the top gaps (e.g., full RiskManager integration first)? Or focus on one area?

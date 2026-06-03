@@ -330,6 +330,12 @@ if not trades_for_close.empty:
     tp_count = int(trades_for_close["_close_reason"].str.contains("TP", na=False).sum())
     st.caption(f"SL hits: {sl_count} | TP hits: {tp_count} (from all reported closed trades)")
 
+    # Attribution by symbol and close reason (enhanced)
+    if "symbol" in trades_for_close.columns:
+        by_sym = trades_for_close.groupby("symbol")["r_multiple"].agg(["count", "mean"]).round(2)
+        st.write("**By Symbol (count, avg R):**")
+        st.dataframe(by_sym)
+
     # Simple equity curve / cumulative R (best for the system - performance visibility)
     if "r_multiple" in trades_for_close.columns:
         r = trades_for_close["r_multiple"].fillna(0).astype(float)

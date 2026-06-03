@@ -20,6 +20,7 @@ from datetime import datetime
 from app.features.structure import compute_market_structure
 from app.engine.confluence import get_structure_signal
 from app.risk import RiskManager, RiskParams
+from app.config import get_settings
 
 
 def run_backtest(
@@ -55,11 +56,13 @@ def run_backtest(
     # Risk manager instance (real one, non-bypassable in sim too)
     rm = None
     if use_risk_manager:
+        s = get_settings()
         params = RiskParams(
             account_equity=equity,
-            starting_equity=starting_equity,
-            target_equity=17000.0,
-            max_daily_loss_pct=6.0,
+            starting_equity=s.risk_starting_equity,
+            target_equity=s.risk_target_equity,
+            max_daily_loss_pct=s.risk_max_daily_loss_pct,
+            base_risk_pct=s.risk_base_pct,
         )
         rm = RiskManager(params)
 

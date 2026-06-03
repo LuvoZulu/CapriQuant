@@ -4,9 +4,11 @@ from fastapi import APIRouter, HTTPException, Query
 from app.features.builder import compute_features, compute_structure, get_enriched_features
 from app.consensus import get_signal as legacy_get_signal
 from app.engine.confluence import get_structure_signal
+from app.engine.multi_timeframe import get_mtf_structure_signal
 from app.utils.signal_logger import log_signal
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
+from app.config import get_settings
 
 # For kill switch / system mode (shared with main)
 try:
@@ -206,14 +208,22 @@ def get_trading_signal(
         # Only fall back to DB if we truly have almost nothing in the live buffer
         df = fetch_candles(conn, symbol, tf_upper, engine=engine, min_candles_override=min_candles)
 
-    if engine == "structure":
-        ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 10)
-        result = get_structure_signal(ms, spread)
+    if engine in ("structure", "mtf", "structure_mtf"):
+        if engine in ("mtf", "structure_mtf"):
+            # Use MTF production path (M5 primary + M1 confirm + M15 filter) when requested or for precision
+            result = get_mtf_structure_signal(normalized, spread=spread, min_candles_m1=8, equity=equity)
+            if result is None:
+                # fallback to single structure if not enough multi-tf data yet
+                ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 10)
+                result = get_structure_signal(ms, spread)
+        else:
+            ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 10)
+            result = get_structure_signal(ms, spread)
     else:
         features = compute_features(df)
         result = legacy_get_signal(features, spread)
 
-    if engine == "structure":
+    if engine in ("structure", "mtf", "structure_mtf"):
         try:
             log_signal(result)
         except Exception:
@@ -234,10 +244,15 @@ def get_trading_signal(
             # today_pnl proxy: realized r * rough risk amount (use 1.5% of current eq as avg)
             avg_risk_money = eq * 0.015
             today_pnl = today_r * avg_risk_money
+            s = get_settings()
             params = RiskParams(
                 account_equity=eq,
-                starting_equity=200.0,
-                target_equity=17000.0,
+                starting_equity=s.risk_starting_equity,
+                target_equity=s.risk_target_equity,
+                max_daily_loss_pct=s.risk_max_daily_loss_pct,
+                base_risk_pct=s.risk_base_pct,
+                aggressive_risk_pct=s.risk_aggressive_pct,
+                conservative_risk_pct=s.risk_conservative_pct,
             )
             rm = RiskManager(params)
             allowed, veto_reason, eff_risk_pct = rm.can_take_trade(

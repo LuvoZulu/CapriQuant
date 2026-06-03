@@ -20,10 +20,12 @@ from app.engine.confluence import (
 from app.live_data import live_buffer, resample_ohlcv
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
+from app.config import get_settings
 
 # Minimum confidence (0-100) to emit BUY/SELL after MTF alignment
-MIN_TRADE_CONFIDENCE = 78.0
-MIN_M5_CONFLUENCE = 0.82
+_s = get_settings()
+MIN_TRADE_CONFIDENCE = _s.mtf_min_confidence
+MIN_M5_CONFLUENCE = _s.mtf_min_m5_confluence
 
 
 def _signal_direction(sig: Dict) -> str:

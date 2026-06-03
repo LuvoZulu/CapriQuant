@@ -8,10 +8,12 @@ from app.api.signals import router as signal_router
 from app.live_data import get_recent_df, live_buffer, add_market_data as update_live_bar
 from app.features.builder import compute_structure
 from app.engine.confluence import get_structure_signal, evaluate_setups
+from app.engine.multi_timeframe import get_mtf_structure_signal
 from app.utils.symbols import symbol_sql_match
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
 from app.engine.management import compute_managements_for_all_opens, compute_management_for_open
+from app.config import get_settings
 
 # =============================================================================
 # KILL SWITCH / SYSTEM MODE (phase 2 P1)
@@ -148,16 +150,22 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
     live_buffer.add_market_data(symbol, data)
 
     # 2. Try to compute real-time signal using recent live data (more aggressive for live path)
+    # Prefer full MTF production path when buffers allow (best for system)
     signal_result = None
     if data.get("_quality_bad"):
         logger.info(f"[DATA_QUALITY] skipping realtime structure for {symbol} due to {data['_quality_bad']}")
     else:
         try:
-            recent_df = live_buffer.get_recent_df_for_structure(symbol, limit=200)
-            if recent_df is not None and len(recent_df) >= 6:
-                # Use a very lenient min_candles for the live path so structure can start forming earlier
-                ms = compute_structure(recent_df, symbol=symbol, timeframe="M1", min_candles=6)
-                signal_result = get_structure_signal(ms, spread=data.get("spread", 0.0))
+            # Try MTF first for precision (M5 primary etc.)
+            mtf_res = get_mtf_structure_signal(symbol, spread=data.get("spread", 0.0), min_candles_m1=6, equity=data.get("equity", 0))
+            if mtf_res and mtf_res.get("signal") not in (None, "HOLD") or (mtf_res and mtf_res.get("engine") == "structure_mtf_precision"):
+                signal_result = mtf_res
+            else:
+                # fallback to single for faster bootstrap
+                recent_df = live_buffer.get_recent_df_for_structure(symbol, limit=200)
+                if recent_df is not None and len(recent_df) >= 6:
+                    ms = compute_structure(recent_df, symbol=symbol, timeframe="M1", min_candles=6)
+                    signal_result = get_structure_signal(ms, spread=data.get("spread", 0.0))
         except Exception as e:
             logger.error(f"Real-time structure processing failed for {symbol}: {e}")
 
@@ -173,7 +181,13 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
                 today_r = get_today_realized_r(None) or 0.0
                 avg_risk_money = eq * 0.015
                 today_pnl = today_r * avg_risk_money
-                params = RiskParams(account_equity=eq, starting_equity=200.0, target_equity=17000.0)
+                s = get_settings()
+                params = RiskParams(
+                    account_equity=eq,
+                    starting_equity=s.risk_starting_equity,
+                    target_equity=s.risk_target_equity,
+                    max_daily_loss_pct=s.risk_max_daily_loss_pct,
+                )
                 rm = RiskManager(params)
                 allowed, veto_reason, eff_risk = rm.can_take_trade(
                     recent_loss_streak=streak, today_pnl=today_pnl, starting_equity_today=eq

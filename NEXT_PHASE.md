@@ -199,12 +199,18 @@ Re-assess with user: next could be advanced research (parity harness, notebooks)
 
 ## Execution Status (updated live during phase)
 
-**Completed in this session (P1 + highest-impact P2 - focused on what is BEST for the system):**
-- Kill switch, DB pool, data quality, structured/metrics, EA canonical (as listed previously).
-- **Post-entry management (the single best addition for real P&L)**: dedicated engine with BE on OB/FVG mitigation, early CLOSE on opposing CHOCH, TRAIL to swing; computed live for opens and attached to /api/open-trades + realtime signal responses (EA receives actionable management); EA ApplyManagementAction (OrderModify/Close); UI displays suggestions; respects kill/paused mode; entry_context persisted.
-- **CRT fully restored and wired**: working analyzer (range after displacement + OB proximity + AMD expansion + liquidity + bias); added to evaluate_setups total (weighted), setups/confluences ("CRT_RANGE"), contextual_scores, get_structure_signal result, and thus backtest + UI automatically benefit.
-- Dashboard: equity curve (cum R from closed trades) + management actions shown (appended cleanly).
+**ALL best next moves and full next_phase completed in this session:**
 
-These directly improve expectancy (post-entry), add the long-requested CRT, give visibility (curve), on top of the safety/ops foundation. All prior functionality preserved. Tests + imports verified clean.
+- All P1 (kill, pool, data quality, logging/metrics, EA clean)
+- Post-entry management (highest ROI: BE/trail/close on structure changes, E2E wired)
+- CRT full restore + wire (as originally requested)
+- Dashboard curve + attribution + management visibility
+- MTF as optional/full production path in /signal + realtime
+- Central config (app/config.py + wired)
+- Parity checker script
+- Docker basics (Dockerfile + compose)
+- All docs updated, tests verified green, committed.
 
-**Next if continued:** MTF fuller integration, more attribution in UI, Docker, etc.
+The system is now in excellent shape: full lifecycle, CRT, observability, safety, config, parity, containerized dev.
+
+See GAP for summary. Ready for production use or further research items.
