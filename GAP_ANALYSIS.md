@@ -152,16 +152,15 @@ It will probably never be a "Renaissance-style quant fund" (different philosophy
 **2026-06 UPDATE: Recommended immediate next actions (the 4 P0) HAVE BEEN EXECUTED.**
 - 1-4 as before (Risk hard layer, honest backtest, tests, secrets+CI).
 
-**Phase 2 (Production Hardening...) - ALL BEST NEXT MOVES + FULL NEXT_PHASE COMPLETED:**
-See NEXT_PHASE.md for full outline + current status.
-Executed:
-- Kill switch, pool, data quality, structured/metrics, EA canonical.
-- Post-entry management (BE/trail/early exit - best for real results).
-- CRT full wire.
-- Dashboard curve + attribution + mgmt.
-- MTF as production path.
-- Central config, parity script, Docker basics.
+**Phase 2 complete + NEW REC PHASE (where from here) STARTED & PARTIALLY EXECUTED:**
+See NEXT_RECOMMENDATIONS.md for prioritized list.
+Recent executions (top recs):
+- MTF now default in /signal (structure) + realtime.
+- Setup stored on trades + expanded dashboard attribution (by setup) + richer curve.
+- Basic alerting (/api/alerts, UI banner, system-status integration for kill/streak/loss/quality).
 
-All tests green, committed. System now in excellent shape for world-class SMC trading.
+See NEXT_RECOMMENDATIONS.md for full Tier A/B/C plan + status.
+All prior + these changes committed; tests/imports green.
+System is now production-strong with excellent visibility and precision defaults.
 
 Would you like a prioritized implementation plan + code sketches for the top gaps (e.g., full RiskManager integration first)? Or focus on one area?

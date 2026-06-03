@@ -579,9 +579,10 @@ void SendTradeReport(string direction, double lots, double sl, double tp1, doubl
    string payload = StringFormat(
       "{\"symbol\":\"%s\",\"direction\":\"%s\",\"entry_price\":%.5f,\"stop_loss\":%.5f,"
       "\"tp1\":%.5f,\"tp2\":%.5f,\"volume_lots\":%.2f,\"outcome\":\"%s\",\"notes\":\"CapriQuant-%s\","
-      "\"ticket\":%I64u,\"status\":\"%s\",\"close_price\":%.5f,\"close_reason\":\"%s\"}",
+      "\"ticket\":%I64u,\"status\":\"%s\",\"close_price\":%.5f,\"close_reason\":\"%s\","
+      "\"setup\":\"%s\"}",
       currentSymbol, direction, entry, sl, tp1, tp2, lots, status, setup,
-      ticket, status, close_price, close_reason);
+      ticket, status, close_price, close_reason, setup);
 
    string headers = "Content-Type: application/json\r\n";
    uchar post_data[];

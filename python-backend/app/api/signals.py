@@ -124,7 +124,7 @@ def get_trading_signal(
     symbol: str,
     timeframe: str,
     spread: float = 0.0,
-    engine: str = Query("legacy", description="legacy | structure"),
+    engine: str = Query("structure", description="structure (now defaults to MTF precision) | mtf | structure_mtf | structure_single (old single-TF) | legacy"),
     min_candles: int = Query(
         None, 
         description="Temporarily lower the minimum candles needed (e.g. ?min_candles=10). Only for Strategy Tester / testing."
@@ -209,13 +209,17 @@ def get_trading_signal(
         df = fetch_candles(conn, symbol, tf_upper, engine=engine, min_candles_override=min_candles)
 
     if engine in ("structure", "mtf", "structure_mtf"):
-        if engine in ("mtf", "structure_mtf"):
-            # Use MTF production path (M5 primary + M1 confirm + M15 filter) when requested or for precision
+        # Default "structure" now prefers full MTF production path (M5 primary + M1 confirm + M15 veto) for best accuracy.
+        # Single-TF fallback only if insufficient multi-TF closed bars.
+        # Use ?engine=structure_single for legacy single-TF behavior if needed.
+        use_mtf = engine in ("mtf", "structure_mtf") or engine == "structure"
+        if use_mtf:
             result = get_mtf_structure_signal(normalized, spread=spread, min_candles_m1=8, equity=equity)
-            if result is None:
-                # fallback to single structure if not enough multi-tf data yet
+            if result is None or result.get("signal") == "HOLD" and "Building" in str(result.get("rationale", "")):
+                # graceful fallback
                 ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 10)
                 result = get_structure_signal(ms, spread)
+                result["engine"] = "structure_fallback_single"
         else:
             ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 10)
             result = get_structure_signal(ms, spread)

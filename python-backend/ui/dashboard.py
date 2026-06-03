@@ -82,6 +82,18 @@ if col4.button("Refresh mode", use_container_width=True):
 if current_mode != "trading":
     st.warning(f"**SYSTEM IS IN {current_mode.upper()} MODE** — normal signals are suppressed. Use RESUME to restore trading.")
 
+# Alerts banner (new rec)
+try:
+    alerts_resp = requests.get(f"{BACKEND}/api/alerts", timeout=2).json()
+    alerts = alerts_resp.get("alerts", [])
+    if alerts:
+        st.error("⚠️ ACTIVE ALERTS")
+        for a in alerts:
+            lvl = a.get("level", "info").upper()
+            st.write(f"**{lvl}** [{a.get('type')}]: {a.get('msg')}")
+except:
+    pass
+
 # Sidebar controls
 st.sidebar.header("Controls")
 auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
@@ -276,7 +288,7 @@ st.subheader("📍 Running / Live Trades (Open Positions from EA)")
 open_trades_df = fetch_open_trades()
 if not open_trades_df.empty:
     # Show key columns if present
-    cols = [c for c in ["ts", "symbol", "direction", "entry_price", "stop_loss", "tp1", "tp2", "volume_lots", "notes", "ticket"] if c in open_trades_df.columns]
+    cols = [c for c in ["ts", "symbol", "direction", "entry_price", "stop_loss", "tp1", "tp2", "volume_lots", "notes", "ticket", "setup"] if c in open_trades_df.columns]
     st.dataframe(open_trades_df[cols] if cols else open_trades_df, use_container_width=True, height=180)
     st.caption(f"{len(open_trades_df)} open trade(s) currently reported by the AutoTrader EA(s).")
 
@@ -330,11 +342,16 @@ if not trades_for_close.empty:
     tp_count = int(trades_for_close["_close_reason"].str.contains("TP", na=False).sum())
     st.caption(f"SL hits: {sl_count} | TP hits: {tp_count} (from all reported closed trades)")
 
-    # Attribution by symbol and close reason (enhanced)
+    # Attribution by symbol, close reason, and setup (fuller now that setup is stored on opens/closes)
     if "symbol" in trades_for_close.columns:
         by_sym = trades_for_close.groupby("symbol")["r_multiple"].agg(["count", "mean"]).round(2)
         st.write("**By Symbol (count, avg R):**")
         st.dataframe(by_sym)
+
+    if "setup" in trades_for_close.columns and trades_for_close["setup"].notna().any():
+        by_setup = trades_for_close[trades_for_close["setup"].notna()].groupby("setup")["r_multiple"].agg(["count", "mean"]).round(2)
+        st.write("**By Setup (count, avg R) - key for edge tuning:**")
+        st.dataframe(by_setup)
 
     # Simple equity curve / cumulative R (best for the system - performance visibility)
     if "r_multiple" in trades_for_close.columns:

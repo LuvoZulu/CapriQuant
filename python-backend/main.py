@@ -31,6 +31,30 @@ SYSTEM_MODE = "trading"  # default
 _QUALITY_BAD = {}  # symbol -> list of (ts, reasons)
 _MAX_QUALITY_BAD = 5
 
+def _compute_current_alerts():
+    """Basic alerting based on current risk state + mode (phase rec)."""
+    alerts = []
+    mode = get_system_mode()
+    if mode != "trading":
+        alerts.append({"level": "critical", "type": "system_mode", "msg": f"System in {mode} mode - trading restricted"})
+
+    try:
+        streak = get_recent_loss_streak(None) or 0
+        today_r = get_today_realized_r(None) or 0.0
+        if streak >= 3:
+            alerts.append({"level": "warning", "type": "streak", "msg": f"Loss streak = {streak}"})
+        if today_r < -3.0:  # rough R threshold
+            alerts.append({"level": "warning", "type": "daily_loss", "msg": f"Today realized R ~ {today_r:.1f}"})
+    except:
+        pass
+
+    # quality issues
+    for s, bads in _QUALITY_BAD.items():
+        if len(bads) > 2:
+            alerts.append({"level": "info", "type": "data_quality", "msg": f"{s} has {len(bads)} recent bad ticks"})
+
+    return alerts
+
 def _load_system_mode():
     global SYSTEM_MODE
     try:
@@ -156,16 +180,15 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
         logger.info(f"[DATA_QUALITY] skipping realtime structure for {symbol} due to {data['_quality_bad']}")
     else:
         try:
-            # Try MTF first for precision (M5 primary etc.)
-            mtf_res = get_mtf_structure_signal(symbol, spread=data.get("spread", 0.0), min_candles_m1=6, equity=data.get("equity", 0))
-            if mtf_res and mtf_res.get("signal") not in (None, "HOLD") or (mtf_res and mtf_res.get("engine") == "structure_mtf_precision"):
-                signal_result = mtf_res
-            else:
-                # fallback to single for faster bootstrap
+            # Always prefer full MTF production path by default (best accuracy for the system)
+            # Fallback to single-TF only on insufficient higher-TF closed data
+            signal_result = get_mtf_structure_signal(symbol, spread=data.get("spread", 0.0), min_candles_m1=6, equity=data.get("equity", 0))
+            if signal_result is None or (signal_result.get("engine") == "structure_mtf_precision" and signal_result.get("signal") == "HOLD" and "Building" in str(signal_result.get("rationale", ""))):
                 recent_df = live_buffer.get_recent_df_for_structure(symbol, limit=200)
                 if recent_df is not None and len(recent_df) >= 6:
                     ms = compute_structure(recent_df, symbol=symbol, timeframe="M1", min_candles=6)
                     signal_result = get_structure_signal(ms, spread=data.get("spread", 0.0))
+                    signal_result["engine"] = "structure_fallback_single"
         except Exception as e:
             logger.error(f"Real-time structure processing failed for {symbol}: {e}")
 
@@ -371,7 +394,7 @@ def api_open_trades(symbol: str = None, limit: int = 50):
     try:
         sym = normalize_symbol(symbol) if symbol else None
         base = """
-            SELECT ts, symbol, direction, entry_price, stop_loss, tp1, tp2, volume_lots, notes, ticket, outcome, entry_context
+            SELECT ts, symbol, direction, entry_price, stop_loss, tp1, tp2, volume_lots, notes, ticket, outcome, entry_context, setup
             FROM executed_trades
             WHERE (outcome = 'open' OR outcome IS NULL OR outcome = '')
         """
@@ -459,6 +482,7 @@ def api_system_status():
         "symbols_tracked": syms,
         "buffers": buffers,
         "recent_data_quality_issues": {s: _QUALITY_BAD.get(s, []) for s in syms},
+        "alerts": _compute_current_alerts(),
     }
 
 @app.get("/metrics")
@@ -481,6 +505,11 @@ def metrics():
     # simple health
     lines.append(f'capri_up 1')
     return "\n".join(lines) + "\n"
+
+@app.get("/api/alerts")
+def api_alerts():
+    """Dedicated alerts endpoint for UI / monitoring (kill, streak, daily loss, quality)."""
+    return {"alerts": _compute_current_alerts(), "timestamp": datetime.utcnow().isoformat()}
 
 @app.get("/api/current-structure/{symbol}")
 def api_current_structure(symbol: str):
@@ -587,7 +616,7 @@ def api_trades(symbol: str = None, limit: int = 200):
         else:
             q = """
                 SELECT ts, symbol, direction, entry_price, stop_loss, tp1, tp2,
-                       r_multiple, outcome, volume_lots, notes
+                       r_multiple, outcome, volume_lots, notes, setup
                 FROM executed_trades
                 ORDER BY ts DESC
                 LIMIT %s
