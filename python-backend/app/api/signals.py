@@ -216,12 +216,12 @@ def get_trading_signal(
     # =============================================================================
     final_signal = result.get("signal", "HOLD") if isinstance(result, dict) else "HOLD"
     risk_info = {}
-    if engine == "structure" and final_signal in ("BUY", "SELL"):
+    if final_signal in ("BUY", "SELL"):
         try:
             eq = float(equity) if equity and equity > 1.0 else 200.0
-            sym_for_risk = normalized
-            streak = get_recent_loss_streak(sym_for_risk) or 0
-            today_r = get_today_realized_r(sym_for_risk) or 0.0
+            # Account-level risk (streak + daily loss circuits protect the whole account, not per-symbol)
+            streak = get_recent_loss_streak(None) or 0
+            today_r = get_today_realized_r(None) or 0.0
             # today_pnl proxy: realized r * rough risk amount (use 1.5% of current eq as avg)
             avg_risk_money = eq * 0.015
             today_pnl = today_r * avg_risk_money

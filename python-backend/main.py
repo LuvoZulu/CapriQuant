@@ -68,8 +68,9 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
             sig = signal_result.get("signal", "HOLD")
             if sig in ("BUY", "SELL"):
                 eq = float(data.get("equity") or data.get("balance") or 200.0)
-                streak = get_recent_loss_streak(symbol) or 0
-                today_r = get_today_realized_r(symbol) or 0.0
+                # Account-level (global) streak + daily PnL for hard circuits — not per-symbol
+                streak = get_recent_loss_streak(None) or 0
+                today_r = get_today_realized_r(None) or 0.0
                 avg_risk_money = eq * 0.015
                 today_pnl = today_r * avg_risk_money
                 params = RiskParams(account_equity=eq, starting_equity=200.0, target_equity=17000.0)

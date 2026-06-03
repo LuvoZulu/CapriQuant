@@ -18,6 +18,8 @@ from app.engine.confluence import (
     apply_m5_risk_levels,
 )
 from app.live_data import live_buffer, resample_ohlcv
+from app.risk import RiskManager, RiskParams
+from app.db import get_recent_loss_streak, get_today_realized_r
 
 # Minimum confidence (0-100) to emit BUY/SELL after MTF alignment
 MIN_TRADE_CONFIDENCE = 78.0
@@ -157,10 +159,12 @@ def get_mtf_structure_signal(
     symbol: str,
     spread: float = 0.0,
     min_candles_m1: int = 8,
+    equity: float = 0.0,
 ) -> Optional[Dict]:
     """
     Build M1/M5/M15 signals from the live M1 buffer and return combined output.
     Returns None if insufficient live data.
+    equity: optional live equity for RiskManager hard veto (account-level circuits).
     """
     df_m1_full = live_buffer.get_recent_df(symbol, limit=10080)
     if df_m1_full is None or len(df_m1_full) < min_candles_m1:
@@ -221,5 +225,31 @@ def get_mtf_structure_signal(
 
     if combined.get("signal") in ("BUY", "SELL"):
         combined = apply_m5_risk_levels(combined, ms_m5, current_price)
+
+    # === HARD RiskManager veto also for MTF final output (account level, non-bypassable) ===
+    # This ensures even if MTF path is used directly, streak/daily circuits apply.
+    try:
+        if combined.get("signal") in ("BUY", "SELL"):
+            eq = float(equity) if equity and equity > 1.0 else 200.0
+            streak = get_recent_loss_streak(None) or 0
+            today_r = get_today_realized_r(None) or 0.0
+            avg_risk_money = eq * 0.015
+            today_pnl = today_r * avg_risk_money
+            params = RiskParams(account_equity=eq, starting_equity=200.0, target_equity=17000.0)
+            rm = RiskManager(params)
+            allowed, veto_reason, eff_risk = rm.can_take_trade(
+                recent_loss_streak=streak, today_pnl=today_pnl, starting_equity_today=eq
+            )
+            combined["risk_pct"] = round(eff_risk, 2)
+            combined["risk_streak"] = streak
+            combined["risk_today_r"] = round(today_r, 2)
+            if not allowed:
+                combined["signal"] = "HOLD"
+                combined["risk_veto"] = veto_reason
+                old_r = combined.get("rationale", "")
+                combined["rationale"] = f"Risk veto: {veto_reason} (streak={streak}). {old_r}".strip()
+    except Exception as e:
+        # non-fatal
+        combined["risk_error"] = str(e)
 
     return combined

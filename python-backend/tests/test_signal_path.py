@@ -50,3 +50,5 @@ def test_mtf_small_buffer_graceful():
     ms = compute_structure(df, "TEST", "M5", min_candles=5)
     sig = get_structure_signal(ms)
     assert sig["signal"] in ("HOLD", "BUY", "SELL")
+    # MTF signature now accepts equity for risk veto (default 0 -> 200)
+    # (full buffer-dependent test would be integration)

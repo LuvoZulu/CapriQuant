@@ -76,6 +76,8 @@ def main():
                 starting_equity=200.0,
                 risk_per_trade=1.8,
                 min_confluence_score=0.68,
+                spread_points=0.30,          # realistic round-turn cost
+                use_risk_manager=True,       # dynamic + hard circuits
             )
 
             summary = result.get("summary", {})
