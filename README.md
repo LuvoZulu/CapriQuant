@@ -249,6 +249,27 @@ This UI is completely optional. The MT5 EA communicates directly with the backen
 
 ---
 
+## Recent Major Additions (Phase 2 + Recommendations)
+
+- **Post-entry management**: Automatic BE on OB/FVG mitigation, trailing to swings, early exit on opposing CHOCH. Fully E2E (backend computes from live structure, EA applies, dashboard shows suggestions). Respects kill/pause.
+- **CRT fully integrated**: Range confluence analyzer contributing to scores and setup names.
+- **MTF as default**: `engine=structure` (and realtime) now prefers MTF precision path (M5 primary) with graceful single-TF fallback.
+- **Central config**: `app/config.py` + env vars (CAPRI_*) for risk, thresholds, symbols, etc. No more magic numbers in key places.
+- **Kill switch + alerts**: Full E2E flatten/pause/resume (UI big red buttons, API, EA honors). Basic alerts for mode, streak, daily loss, data quality (/api/alerts + UI banner).
+- **Observability**: /metrics (prometheus text), data quality gate, structured logs with ids.
+- **Dashboard**: Equity curve (cum R), attribution by symbol/setup/close_reason, management actions visible, kill controls.
+- **EA**: One canonical (FULL_PASTE_READY recommended), setup reporting, management + kill support.
+- **Dev tools**: Docker (compose with postgres), parity checker script (check_parity.py), DB pool everywhere, tests for core + new features.
+- **Honest everything**: Backtest with costs + RM, live-vs-backtest parity tool.
+
+**To enable new features**: Use the updated .env.example. MTF is now default. Management on by default via config.
+
+Paper trade thoroughly. Use the kill switch liberally while building confidence.
+
+See GAP_ANALYSIS.md and NEXT_RECOMMENDATIONS.md for full history and future plan.
+
+---
+
 ## Quick Directory Reference
 
 - Backend code: `python-backend\`
