@@ -14,7 +14,7 @@ Never risk what you cannot afford to lose. This module will try to save you from
 """
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal, Optional, Dict, Tuple
 import math
 
 
@@ -134,8 +134,30 @@ class RiskManager:
 
     def can_trade_today(self, today_pnl: float, starting_equity_today: float) -> bool:
         """Circuit breaker."""
+        if starting_equity_today <= 0:
+            return True
         daily_loss_pct = (today_pnl / starting_equity_today) * 100.0
         return daily_loss_pct > -self.p.max_daily_loss_pct
+
+    def can_take_trade(
+        self,
+        recent_loss_streak: int = 0,
+        today_pnl: float = 0.0,
+        starting_equity_today: float = None,
+    ) -> tuple[bool, str, float]:
+        """
+        Hard non-bypassable layer.
+        Returns: (allowed: bool, veto_reason: str, effective_risk_pct: float)
+        Daily loss and high streak are HARD vetoes (signal -> HOLD).
+        """
+        eq = self.p.account_equity
+        start_eq = starting_equity_today or eq or 200.0
+        if not self.can_trade_today(today_pnl, start_eq):
+            return False, f"DAILY_LOSS_CIRCUIT (today_pnl={today_pnl:.2f} vs cap {self.p.max_daily_loss_pct}%)", 0.0
+        if recent_loss_streak >= 4:
+            return False, f"LOSS_STREAK_CIRCUIT ({recent_loss_streak} consecutive losses)", 0.0
+        risk_pct = self.current_risk_pct(recent_loss_streak)
+        return True, "", risk_pct
 
     def validate_structure_stop(
         self,

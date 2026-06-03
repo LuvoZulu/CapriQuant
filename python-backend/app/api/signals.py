@@ -5,6 +5,8 @@ from app.features.builder import compute_features, compute_structure, get_enrich
 from app.consensus import get_signal as legacy_get_signal
 from app.engine.confluence import get_structure_signal
 from app.utils.signal_logger import log_signal
+from app.risk import RiskManager, RiskParams
+from app.db import get_recent_loss_streak, get_today_realized_r
 
 router = APIRouter()
 
@@ -111,6 +113,7 @@ def get_trading_signal(
         None, 
         description="Temporarily lower the minimum candles needed (e.g. ?min_candles=10). Only for Strategy Tester / testing."
     ),
+    equity: float = Query(0.0, description="Current account equity for risk sizing and circuits (from EA)."),
 ):
     from app.db import conn
 
@@ -125,12 +128,28 @@ def get_trading_signal(
     min_required = max(min_required, 5)
 
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT COUNT(*) FROM market_data WHERE symbol = %s AND timeframe = %s",
-        (normalized, tf_upper)
-    )
-    candles_available = cursor.fetchone()[0]
-    cursor.close()
+    try:
+        try:
+            conn.rollback()  # clear any previous aborted tx from other queries (e.g. dashboard)
+        except:
+            pass
+        cursor.execute(
+            "SELECT COUNT(*) FROM market_data WHERE symbol = %s AND timeframe = %s",
+            (normalized, tf_upper)
+        )
+        candles_available = cursor.fetchone()[0]
+    except Exception as e:
+        print(f"[SIGNALS] count candles failed for {normalized}: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
+        candles_available = 0
+    finally:
+        try:
+            cursor.close()
+        except:
+            pass
 
     if candles_available < min_required:
         friendly = {
@@ -161,8 +180,8 @@ def get_trading_signal(
 
     # Strongly prefer live aggregated data for real-time structure decisions
     # Use closed bars (no forming minute) for accurate structure (timestamp + accuracy fix)
-    from app.live_data import get_recent_closed_df, get_recent_df, get_latest_price
-    live_df = get_recent_closed_df(normalized, limit=200) or get_recent_df(normalized, min_bars=10)
+    from app.live_data import get_recent_df_for_structure, get_latest_price
+    live_df = get_recent_df_for_structure(normalized, limit=200)
 
     if live_df is not None and len(live_df) >= 6:
         df = live_df
@@ -191,12 +210,76 @@ def get_trading_signal(
         except Exception:
             pass
 
+    # =============================================================================
+    # HARD RiskManager layer (non-bypassable): live equity + streak + daily loss veto
+    # Must run for every BUY/SELL decision. Turns risky signals into HOLD.
+    # =============================================================================
+    final_signal = result.get("signal", "HOLD") if isinstance(result, dict) else "HOLD"
+    risk_info = {}
+    if engine == "structure" and final_signal in ("BUY", "SELL"):
+        try:
+            eq = float(equity) if equity and equity > 1.0 else 200.0
+            sym_for_risk = normalized
+            streak = get_recent_loss_streak(sym_for_risk) or 0
+            today_r = get_today_realized_r(sym_for_risk) or 0.0
+            # today_pnl proxy: realized r * rough risk amount (use 1.5% of current eq as avg)
+            avg_risk_money = eq * 0.015
+            today_pnl = today_r * avg_risk_money
+            params = RiskParams(
+                account_equity=eq,
+                starting_equity=200.0,
+                target_equity=17000.0,
+            )
+            rm = RiskManager(params)
+            allowed, veto_reason, eff_risk_pct = rm.can_take_trade(
+                recent_loss_streak=streak,
+                today_pnl=today_pnl,
+                starting_equity_today=eq,
+            )
+            risk_info = {
+                "risk_pct": round(eff_risk_pct, 2),
+                "risk_streak": streak,
+                "risk_today_r": round(today_r, 2),
+                "risk_veto": None if allowed else veto_reason,
+            }
+            if not allowed:
+                final_signal = "HOLD"
+                # update rationale
+                old_rationale = result.get("rationale", "") if isinstance(result, dict) else ""
+                new_rationale = f"Risk veto: {veto_reason} (streak={streak}, daily_r={today_r:.1f}). {old_rationale}".strip()
+                if isinstance(result, dict):
+                    result["signal"] = "HOLD"
+                    result["rationale"] = new_rationale
+                print(f"[RISK VETO] {normalized} {final_signal} <- was {result.get('signal','?')} : {veto_reason}")
+            else:
+                # attach validated stop if structure provided one (for EA to prefer)
+                if isinstance(result, dict):
+                    for cand in ("validated_stop", "stop_suggestion", "stop"):
+                        if cand in result and result[cand]:
+                            risk_info["validated_stop"] = result[cand]
+                            break
+                    if "validated_stop" not in risk_info and "market_structure" in result:
+                        ms = result["market_structure"]
+                        if isinstance(ms, dict):
+                            # try common places
+                            for p in (ms.get("stop_suggestion"), ms.get("current_price")):
+                                if p:
+                                    risk_info["validated_stop"] = p
+                                    break
+        except Exception as e:
+            print(f"[RISK] layer error (non-fatal, allowing original): {e}")
+            risk_info = {"risk_error": str(e)}
+
     response_body = {
         "symbol": normalized,
         "timeframe": tf_upper,
         "engine": engine,
         **result,
     }
+    if risk_info:
+        response_body.update(risk_info)
+    if final_signal == "HOLD" and response_body.get("signal") != "HOLD":
+        response_body["signal"] = "HOLD"
 
     # === Force live price into the response for real-time feel ===
     try:

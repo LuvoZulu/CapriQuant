@@ -40,11 +40,22 @@ __pycache__/
 # Testing data (large csvs)
 testing/*.csv
 
-# Secrets
+# Secrets (robust - catch anywhere + subdirs)
+**/.env
+**/.env.*
+**/*.env
+.env.local
 *.pem
 *.rdp
 security/
+security/**
 
 # Streamlit / UI cache
 .streamlit/
 
+
+# Environment secrets (legacy root)
+.env
+.env.*
+*.env
+python-backend/.env

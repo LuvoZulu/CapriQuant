@@ -60,6 +60,13 @@ def ensure_live_tables():
     if cursor is None:
         return
     try:
+        try:
+            conn.rollback()
+        except:
+            pass
+    except:
+        pass
+    try:
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS live_signals (
             id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT NOW(), symbol TEXT NOT NULL,
@@ -153,3 +160,90 @@ def persist_trade(trade: dict):
         print("persist_trade warning:", e)
 
 ensure_live_tables()
+
+
+# =============================================================================
+# Risk context queries (for hard RiskManager veto layer)
+# =============================================================================
+from datetime import datetime as _dt, date as _date
+
+def get_recent_loss_streak(symbol: str = None, lookback: int = 12) -> int:
+    """Count consecutive recent losses (r_multiple < 0 or close_reason=='sl' or outcome loss-like).
+    Scans from most recent closed trades backward until a non-loss.
+    """
+    if cursor is None:
+        return 0
+    try:
+        try:
+            conn.rollback()
+        except:
+            pass
+        params = []
+        sym_clause = ""
+        if symbol:
+            sym_clause = "AND symbol = %s"
+            params = [symbol]
+        # Prefer closed trades that have outcome or close_reason
+        q = f"""
+            SELECT r_multiple, close_reason, outcome
+            FROM executed_trades
+            WHERE (close_reason IS NOT NULL OR outcome NOT IN ('open','') OR r_multiple IS NOT NULL)
+              {sym_clause}
+            ORDER BY COALESCE(close_ts, ts) DESC
+            LIMIT %s
+        """
+        exec_params = params + [lookback] if params else [lookback]
+        cursor.execute(q, exec_params)
+        rows = cursor.fetchall()
+        streak = 0
+        for r in rows:
+            rm = r[0] if r[0] is not None else 0.0
+            cr = (r[1] or "").lower()
+            oc = (r[2] or "").lower()
+            is_loss = (rm < 0) or ("sl" in cr) or (oc in ("loss", "sl", "stop"))
+            if is_loss:
+                streak += 1
+            else:
+                break  # first non-loss stops the consecutive count
+        return streak
+    except Exception as e:
+        print(f"[DB] get_recent_loss_streak failed: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
+        return 0
+
+
+def get_today_realized_r(symbol: str = None) -> float:
+    """Sum of r_multiple for trades that closed today (for daily loss circuit proxy)."""
+    if cursor is None:
+        return 0.0
+    try:
+        try:
+            conn.rollback()
+        except:
+            pass
+        today = _date.today()
+        params = [today]
+        sym_clause = ""
+        if symbol:
+            sym_clause = "AND symbol = %s"
+            params.append(symbol)
+        q = f"""
+            SELECT COALESCE(SUM(r_multiple), 0.0)
+            FROM executed_trades
+            WHERE DATE(COALESCE(close_ts, ts)) = %s
+              AND (close_reason IS NOT NULL OR (outcome NOT IN ('open','') AND r_multiple IS NOT NULL))
+              {sym_clause}
+        """
+        cursor.execute(q, params)
+        row = cursor.fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+    except Exception as e:
+        print(f"[DB] get_today_realized_r failed: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
+        return 0.0
