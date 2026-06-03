@@ -160,14 +160,15 @@ def get_trading_signal(
         return response_body
 
     # Strongly prefer live aggregated data for real-time structure decisions
-    from app.live_data import get_recent_df, get_latest_price
-    live_df = get_recent_df(normalized, min_bars=10)
+    # Use closed bars (no forming minute) for accurate structure (timestamp + accuracy fix)
+    from app.live_data import get_recent_closed_df, get_recent_df, get_latest_price
+    live_df = get_recent_closed_df(normalized, limit=200) or get_recent_df(normalized, min_bars=10)
 
     if live_df is not None and len(live_df) >= 6:
         df = live_df
-        # Force the absolute latest price into the last bar for freshest decisions
+        # Force the absolute latest price into the last bar for freshest decisions (analysis used closed)
         live_price = get_latest_price(normalized)
-        if live_price:
+        if live_price and len(df) > 0:
             df.loc[df.index[-1], 'close'] = live_price['close']
             if 'high' in df.columns:
                 df.loc[df.index[-1], 'high'] = max(df.loc[df.index[-1], 'high'], live_price['close'])

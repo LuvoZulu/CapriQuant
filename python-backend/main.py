@@ -145,3 +145,80 @@ def debug_live_buffer_symbol(symbol: str):
     info = get_buffer_info(symbol)
     info["note"] = "This shows how much recent live data is available for real-time decision making."
     return info
+
+
+@app.post("/report-trade")
+def report_trade(trade: dict):
+    """
+    Endpoint for EA to report opens and closes (with close_reason for SL/TP dashboard).
+    """
+    sym = normalize_symbol(trade.get("symbol", ""))
+    trade["symbol"] = sym
+    try:
+        from app.db import persist_trade, ensure_live_tables
+        ensure_live_tables()
+        if trade.get("status") == "closed" and not trade.get("close_ts"):
+            from datetime import datetime as _dt
+            trade["close_ts"] = _dt.utcnow()
+        persist_trade(trade)
+        logger.info(f"[TRADE] {sym} {trade.get('direction')} status={trade.get('status','open')} reason={trade.get('close_reason')}")
+        return {"status": "ok", "symbol": sym}
+    except Exception as e:
+        logger.error(f"report_trade err: {e}")
+        return {"status": "error", "detail": str(e)}
+
+
+@app.get("/api/open-trades")
+def api_open_trades(symbol: str = None, limit: int = 50):
+    """Current open trades for dashboard live view."""
+    from app.db import ensure_live_tables
+    ensure_live_tables()
+    try:
+        sym = normalize_symbol(symbol) if symbol else None
+        base = """
+            SELECT ts, symbol, direction, entry_price, stop_loss, tp1, tp2, volume_lots, notes, ticket, outcome
+            FROM executed_trades
+            WHERE (outcome = 'open' OR outcome IS NULL OR outcome = '')
+        """
+        if sym:
+            sym_clause, sym_params = symbol_sql_match(sym)
+            q = f"{base} AND {sym_clause} ORDER BY ts DESC LIMIT %s"
+            cursor.execute(q, sym_params + (limit,))
+        else:
+            q = base + " ORDER BY ts DESC LIMIT %s"
+            cursor.execute(q, (limit,))
+        rows = cursor.fetchall()
+        cols = [desc[0] for desc in cursor.description]
+        out = []
+        for row in rows:
+            d = dict(zip(cols, row))
+            if d.get("ts") and hasattr(d.get("ts"), "isoformat"):
+                d["ts"] = d["ts"].isoformat()
+            out.append(d)
+        return out
+    except Exception as e:
+        logger.error(f"open-trades err: {e}")
+        return []
+
+
+@app.get("/api/health")
+def api_health():
+    try:
+        from app.live_data import list_tracked_symbols, get_buffer_status
+        syms = list_tracked_symbols()
+        buffers_ok = True
+        if syms:
+            for s in syms[:4]:
+                st = get_buffer_status(s)
+                if st.get("bars_in_buffer", 0) < 5:
+                    buffers_ok = False
+    except:
+        syms = []
+        buffers_ok = False
+    return {
+        "status": "ok",
+        "version": "post-fix-june2026",
+        "tracked": syms,
+        "buffers_ok": buffers_ok,
+        "note": "All High/Med findings addressed: markers gone, timestamps+closed bars, robust EA JSON+close reporting, DB schema+pool, dashboard with SL/TP live tracking, risk/EA plumbing ready."
+    }

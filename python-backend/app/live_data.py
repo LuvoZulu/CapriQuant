@@ -162,3 +162,14 @@ def get_buffer_info(symbol: str) -> dict:
         "newest": buf[-1]["timestamp"].isoformat() if buf else None,
         "latest_close": buf[-1]["close"] if buf else None,
     }
+
+
+def get_recent_closed_df(symbol: str, limit=None):
+    """
+    Returns recent M1 bars excluding the current forming (last) minute.
+    Strongly recommended for live structure calls (compute_structure, MTF) to avoid spurious swings, BOS/CHOCH, OBs, FVGs and CRT from the still-updating bar.
+    """
+    df = get_recent_df(symbol, limit)
+    if df is None or len(df) < 2:
+        return df
+    return df.iloc[:-1].reset_index(drop=True)
