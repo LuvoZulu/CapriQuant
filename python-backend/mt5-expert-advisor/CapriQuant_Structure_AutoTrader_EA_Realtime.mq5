@@ -250,6 +250,32 @@ void ProcessSignalResponse(string json)
    }
    // =====================================================
 
+   // ===== POST-ENTRY MANAGEMENT (phase2 - best for system) =====
+   // Can come at top level (from realtime) or inside signal
+   string mgmt_action = ExtractJsonString(json, "management_action");
+   if(mgmt_action == "") mgmt_action = ExtractJsonString(json, "action");  // fallback
+   double mgmt_new_sl = ExtractJsonDouble(json, "new_sl");
+   if(mgmt_new_sl <= 0) mgmt_new_sl = ExtractJsonDouble(json, "management_new_sl");
+   string mgmt_reason = ExtractJsonString(json, "management_reason");
+   if(mgmt_reason == "") mgmt_reason = ExtractJsonString(json, "reason");
+
+   // Also check nested if "management" object sent
+   if(mgmt_action == "" && StringFind(json, "\"management\"") >= 0)
+   {
+      // crude nested extract for common keys
+      mgmt_action = ExtractJsonString(json, "management_action");
+      if(mgmt_action == "") mgmt_action = ExtractJsonString(StringSubstr(json, StringFind(json,"\"management\"")), "action");
+   }
+
+   if(mgmt_action != "" && (mgmt_action == "MOVE_BE" || mgmt_action == "TRAIL_SL" || mgmt_action == "CLOSE" || mgmt_action == "EXIT"))
+   {
+      Print("[CapriQuant] MANAGEMENT SUGGESTION: ", mgmt_action, " sl=", mgmt_new_sl, " reason=", mgmt_reason);
+      ApplyManagementAction(mgmt_action, mgmt_new_sl, mgmt_reason);
+      // continue to normal signal processing (or return if close)
+      if(mgmt_action == "CLOSE" || mgmt_action == "EXIT") return;
+   }
+   // ==========================================================
+
    if(signalDir == "HOLD")
    {
       int candles = (int)ExtractJsonDouble(json, "candles_available");
@@ -465,6 +491,54 @@ ulong ExecuteTrade(string direction, double lots, double sl, double tp1, double 
       return 0;
    }
    return res.order;
+}
+
+// Management action applier (post-entry: BE, trail, close) - best for the system
+void ApplyManagementAction(string action, double new_sl, string reason, ulong ticket = 0)
+{
+   if(action == "CLOSE" || action == "EXIT")
+   {
+      CloseAllPositions(reason != "" ? reason : "management_close");
+      return;
+   }
+
+   if(new_sl <= 0) return;
+
+   // Find the position for this magic/symbol
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong posT = PositionGetTicket(i);
+      if(PositionSelectByTicket(posT))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == currentSymbol &&
+            PositionGetInteger(POSITION_MAGIC) == Magic)
+         {
+            double cur_sl = PositionGetDouble(POSITION_SL);
+            // Only modify if meaningfully better
+            bool is_long = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+            bool better = (is_long && new_sl > cur_sl + _Point*5) || (!is_long && new_sl < cur_sl - _Point*5);
+            if(!better) return;
+
+            MqlTradeRequest req = {};
+            MqlTradeResult  res = {};
+            req.action = TRADE_ACTION_SLTP;
+            req.position = posT;
+            req.symbol = currentSymbol;
+            req.sl = new_sl;
+            req.tp = PositionGetDouble(POSITION_TP);
+            req.magic = Magic;
+            req.comment = "CapriQuant-mgmt-" + reason;
+
+            if(OrderSend(req, res))
+            {
+               Print("[CapriQuant] MANAGEMENT ", action, " applied newSL=", new_sl, " reason=", reason);
+               // Report the update
+               SendTradeReport("MANAGEMENT", PositionGetDouble(POSITION_VOLUME), new_sl, req.tp, req.tp, reason, posT, "open", PositionGetDouble(POSITION_PRICE_OPEN));
+            }
+            return;
+         }
+      }
+   }
 }
 
 string ExtractJsonString(string json, string key)

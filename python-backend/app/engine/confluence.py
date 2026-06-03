@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from app.features.structure import MarketStructure, OrderBlock
 
 # Import the fully rewritten contextual analyzers
-from app.strategies import amd, fibonacci, price_action, liquidity
+from app.strategies import amd, fibonacci, price_action, liquidity, crt
 from app.utils.signal_logger import log_signal
 
 
@@ -201,8 +201,15 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
     fib_score = fibonacci.analyze_fib_confluence(ms)
     pa_score = price_action.analyze_price_action_contextual(ms)
     liq_score = liquidity.analyze_liquidity_sweeps(ms)
+    crt_score = crt.analyze_crt_range_confluence(
+        df=ms.df if hasattr(ms, "df") else None,
+        market_structure=ms,
+        recent_displacement=getattr(ms, "atr", 0) * 1.5,  # rough
+        bias=getattr(ms, "bias", "NEUTRAL"),
+        atr=getattr(ms, "atr", 0),
+    )
 
-    total_confluence = amd_score + fib_score + pa_score + liq_score
+    total_confluence = amd_score + fib_score + pa_score + liq_score + (crt_score * 0.6)
 
     # Global quality gate - lowered for frequency while still requiring decent confluence
     if total_confluence < 0.48:
@@ -421,6 +428,10 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
         if abs(liq_score) > 0.35: extra.append("LIQUIDITY_SWEEP")
         if extra:
             setup.confluences = list(set(setup.confluences + extra))
+        if abs(crt_score) > 0.25:
+            extra.append("CRT_RANGE")
+            if abs(crt_score) > 0.4:
+                setup.confluences = list(set(setup.confluences + ["CRT_RANGE_RETEST"]))
 
     # ------------------------------------------------------------------
     # FINAL FILTER (balanced for frequency + quality)
@@ -471,7 +482,14 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
     fib_score = fibonacci.analyze_fib_confluence(ms)
     pa_score = price_action.analyze_price_action_contextual(ms)
     liq_score = liquidity.analyze_liquidity_sweeps(ms)
-    total_confluence = amd_score + fib_score + pa_score + liq_score
+    crt_score = crt.analyze_crt_range_confluence(
+        df=ms.df if hasattr(ms, "df") else None,
+        market_structure=ms,
+        recent_displacement=getattr(ms, "atr", 0) * 1.5,
+        bias=getattr(ms, "bias", "NEUTRAL"),
+        atr=getattr(ms, "atr", 0),
+    )
+    total_confluence = amd_score + fib_score + pa_score + liq_score + (crt_score * 0.6)
 
     result = {
         "signal": best.direction,
@@ -493,6 +511,7 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
             "fib_confluence": round(fib_score, 3),
             "price_action": round(pa_score, 3),
             "liquidity": round(liq_score, 3),
+            "crt": round(crt_score, 3),
             "total": round(total_confluence, 3),
         },
         "market_structure": ms.to_dict(),

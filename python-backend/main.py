@@ -11,6 +11,7 @@ from app.engine.confluence import get_structure_signal, evaluate_setups
 from app.utils.symbols import symbol_sql_match
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
+from app.engine.management import compute_managements_for_all_opens, compute_management_for_open
 
 # =============================================================================
 # KILL SWITCH / SYSTEM MODE (phase 2 P1)
@@ -222,6 +223,30 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
         for k in ("risk_pct", "risk_streak", "risk_veto", "validated_stop", "system_mode", "action"):
             if k in signal_result:
                 response[k] = signal_result[k]
+
+        # Post-entry management suggestions for any current opens on this symbol (best for the system)
+        try:
+            from app.db import db_cursor
+            with db_cursor() as (c, cur):
+                cur.execute("""
+                    SELECT ts, symbol, direction, entry_price, stop_loss, tp1, tp2, volume_lots, notes, ticket, outcome
+                    FROM executed_trades
+                    WHERE symbol = %s AND (outcome = 'open' OR outcome IS NULL OR outcome = '')
+                    ORDER BY ts DESC LIMIT 5
+                """, (symbol,))
+                opens = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
+            if opens:
+                from app.features.builder import compute_structure
+                df_m5 = live_buffer.get_recent_m5_df(symbol, limit=200)
+                if df_m5 is not None and len(df_m5) >= 5:
+                    ms = compute_structure(df_m5, symbol=symbol, timeframe="M5", min_candles=5)
+                    mgmts = compute_managements_for_all_opens(opens, {symbol: ms}, get_system_mode())
+                    if mgmts:
+                        response["management"] = mgmts[0]  # primary for this symbol
+                        # also promote to signal for EA parsing
+                        signal_result["management"] = mgmts[0]
+        except Exception as _me:
+            pass  # non fatal
     else:
         base_hold = {
             "signal": "HOLD",
@@ -325,13 +350,14 @@ def report_trade(trade: dict):
 
 @app.get("/api/open-trades")
 def api_open_trades(symbol: str = None, limit: int = 50):
-    """Current open trades for dashboard live view. (now pooled)"""
+    """Current open trades for dashboard live view. (now pooled) + management suggestions"""
     from app.db import ensure_live_tables, db_cursor
+    from app.features.builder import compute_structure
     ensure_live_tables()
     try:
         sym = normalize_symbol(symbol) if symbol else None
         base = """
-            SELECT ts, symbol, direction, entry_price, stop_loss, tp1, tp2, volume_lots, notes, ticket, outcome
+            SELECT ts, symbol, direction, entry_price, stop_loss, tp1, tp2, volume_lots, notes, ticket, outcome, entry_context
             FROM executed_trades
             WHERE (outcome = 'open' OR outcome IS NULL OR outcome = '')
         """
@@ -356,7 +382,27 @@ def api_open_trades(symbol: str = None, limit: int = 50):
                 if d.get("ts") and hasattr(d.get("ts"), "isoformat"):
                     d["ts"] = d["ts"].isoformat()
                 out.append(d)
-            return out
+
+        # Attach management suggestions using current live structures
+        if out:
+            live_mss = {}
+            for t in out:
+                s = t.get("symbol")
+                if s and s not in live_mss:
+                    try:
+                        df = live_buffer.get_recent_m5_df(s, limit=200)
+                        if df is not None and len(df) >= 5:
+                            ms = compute_structure(df, symbol=s, timeframe="M5", min_candles=5)
+                            live_mss[s] = ms
+                    except:
+                        pass
+            managements = compute_managements_for_all_opens(out, live_mss, get_system_mode())
+            mgmt_by_ticket = {m["ticket"]: m for m in managements}
+            for t in out:
+                tkt = t.get("ticket")
+                if tkt in mgmt_by_ticket:
+                    t["management"] = mgmt_by_ticket[tkt]
+        return out
     except Exception as e:
         logger.error(f"open-trades err: {e}")
         return []

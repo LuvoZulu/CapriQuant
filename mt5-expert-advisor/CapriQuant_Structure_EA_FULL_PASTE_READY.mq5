@@ -250,6 +250,21 @@ void ProcessSignalResponse(string json)
    }
    // ===============================
 
+   // Post-entry management support (phase2)
+   string mgmt_action = ExtractJsonString(json, "management_action");
+   if(mgmt_action == "") mgmt_action = ExtractJsonString(json, "action");
+   double mgmt_new_sl = ExtractJsonDouble(json, "new_sl");
+   if(mgmt_new_sl <= 0) mgmt_new_sl = ExtractJsonDouble(json, "management_new_sl");
+   string mgmt_reason = ExtractJsonString(json, "management_reason");
+   if(mgmt_reason == "") mgmt_reason = ExtractJsonString(json, "reason");
+   if(mgmt_action != "" && (mgmt_action == "MOVE_BE" || mgmt_action == "TRAIL_SL" || mgmt_action == "CLOSE"))
+   {
+      Print("[CapriQuant] MGMT: ", mgmt_action, " ", mgmt_reason);
+      // reuse CloseAll if present, or simple close logic; for full modify would need similar helper
+      if(mgmt_action == "CLOSE") CloseAllPositions(mgmt_reason);
+      // For MOVE_BE/TRAIL, basic modify would be added similarly to the realtime variant
+   }
+
    if(signalDir == "HOLD")
    {
       int candles = (int)ExtractJsonDouble(json, "candles_available");

@@ -113,7 +113,7 @@ def ensure_live_tables():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec_trades_sym_ts ON executed_trades (symbol, ts DESC);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec_trades_ticket ON executed_trades (ticket);")
 
-        for col in ["ticket BIGINT", "close_price DOUBLE PRECISION", "close_ts TIMESTAMPTZ", "close_reason TEXT"]:
+        for col in ["ticket BIGINT", "close_price DOUBLE PRECISION", "close_ts TIMESTAMPTZ", "close_reason TEXT", "entry_context JSONB"]:
             try:
                 cursor.execute("ALTER TABLE executed_trades ADD COLUMN IF NOT EXISTS " + col + ";")
             except: pass
@@ -144,7 +144,8 @@ def persist_trade(trade: dict):
                     close_reason = COALESCE(%s, close_reason),
                     outcome = COALESCE(%s, outcome),
                     r_multiple = COALESCE(%s, r_multiple),
-                    notes = COALESCE(%s, notes)
+                    notes = COALESCE(%s, notes),
+                    entry_context = COALESCE(%s, entry_context)
                 WHERE ticket = %s
             """, (
                 trade.get("close_price"),
@@ -153,18 +154,19 @@ def persist_trade(trade: dict):
                 trade.get("outcome", "open"),
                 trade.get("r_multiple"),
                 trade.get("notes"),
+                trade.get("entry_context"),
                 ticket
             ))
             if cursor.rowcount == 0:
                 cursor.execute("""
                     INSERT INTO executed_trades (symbol, direction, entry_price, stop_loss, tp1, tp2,
-                        r_multiple, outcome, volume_lots, notes, ticket, close_price, close_ts, close_reason)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        r_multiple, outcome, volume_lots, notes, ticket, close_price, close_ts, close_reason, entry_context)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (
                     trade.get("symbol"), trade.get("direction"), trade.get("entry_price"), trade.get("stop_loss"),
                     trade.get("tp1"), trade.get("tp2"), trade.get("r_multiple"), trade.get("outcome", "open"),
                     trade.get("volume_lots"), trade.get("notes"), ticket, trade.get("close_price"),
-                    trade.get("close_ts"), trade.get("close_reason")
+                    trade.get("close_ts"), trade.get("close_reason"), trade.get("entry_context")
                 ))
         else:
             cursor.execute("""

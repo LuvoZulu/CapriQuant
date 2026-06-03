@@ -279,6 +279,16 @@ if not open_trades_df.empty:
     cols = [c for c in ["ts", "symbol", "direction", "entry_price", "stop_loss", "tp1", "tp2", "volume_lots", "notes", "ticket"] if c in open_trades_df.columns]
     st.dataframe(open_trades_df[cols] if cols else open_trades_df, use_container_width=True, height=180)
     st.caption(f"{len(open_trades_df)} open trade(s) currently reported by the AutoTrader EA(s).")
+
+    # Show management suggestions if present (post-entry structure actions)
+    if "management" in open_trades_df.columns:
+        mgmt_df = open_trades_df[open_trades_df["management"].notna()][["ticket", "symbol", "management"]].copy()
+        if not mgmt_df.empty:
+            st.markdown("**Suggested Management Actions (from current structure):**")
+            for _, row in mgmt_df.iterrows():
+                m = row["management"]
+                if isinstance(m, dict):
+                    st.write(f"Ticket {row['ticket']} {row['symbol']}: **{m.get('action')}** → SL={m.get('new_sl')} | {m.get('reason')} (conf {m.get('confidence',0)})")
 else:
     st.info("No open/running trades reported yet. EA must POST to /report-trade when positions open.")
 
@@ -319,6 +329,14 @@ if not trades_for_close.empty:
     sl_count = int(trades_for_close["_close_reason"].str.contains("SL", na=False).sum())
     tp_count = int(trades_for_close["_close_reason"].str.contains("TP", na=False).sum())
     st.caption(f"SL hits: {sl_count} | TP hits: {tp_count} (from all reported closed trades)")
+
+    # Simple equity curve / cumulative R (best for the system - performance visibility)
+    if "r_multiple" in trades_for_close.columns:
+        r = trades_for_close["r_multiple"].fillna(0).astype(float)
+        if len(r) > 0:
+            cum_r = r.cumsum()
+            st.line_chart(cum_r.rename("Cumulative R"), height=180)
+            st.caption("Cumulative realized R (from reported closed trades). Positive slope = edge working.")
 else:
     st.info("No closed trades yet with reasons. When EA detects SL/TP hits (via history deals), it reports with close_reason.")
 
