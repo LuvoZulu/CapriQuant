@@ -2,13 +2,13 @@
 Live Data Buffer for real-time TICK to M1 aggregation (simpler updating logic).
 
 Supports the real-time POST /market-data path.
-Buffer size now strictly 1440 M1 bars (1 day) — per requirement to limit trend/structure checks and displays after system off / restart.
-No more 8000+ candle buffers; 1 trading day has 1440 M1 candles (24h * 60).
-The deque uses maxlen=1441 to hold up to 1440 completed + the current forming minute.
+Buffer: caps at 1 week of M1 candles (10080) + space for another 4 days (5760) = 15840 before rewriting (dropping oldest on append).
+After system turns on (post-off), only last 1440 (1 day) used for trend/structure checks (via backfill cap + filters).
+The deque uses maxlen = MAX + 1 to hold completed + current forming minute.
 The last entry in the buffer for a symbol is always the current forming minute and gets updated live on every call within the minute.
 This makes the buffer (and debug/UI) show data immediately and the numbers update on every incoming payload.
 Data comes directly from the market (via EA TICK/M1 payloads), not DB.
-New bars are ALWAYS ingested/processed even when at capacity (oldest auto-dropped by deque).
+New bars are ALWAYS ingested/processed (deque auto-drops oldest when full).
 """
 
 from collections import deque
@@ -25,10 +25,11 @@ LIVE_BARS: Dict[str, Deque[dict]] = {}
 # Real per-symbol tick counters (for debug visibility)
 TICK_STATS: Dict[str, int] = {}
 
-# 1440 M1 bars (strict 1 day: 24 * 60) — limit for post-off trend/structure checks and all displays.
-# (Previously 10080 for a week; user requested no more than 1 day, and 8k+ is way more than 1440 in 1 day.)
-MAX_COMPLETED_BARS = 24 * 60
-# 288 M5 bars (1 day: 24 * 12) — derived from M1
+# Storage buffer: cap at 1 week (10080 M1) + 4 days headroom (5760) = 15840 before rewriting starts.
+# After system turns on (post-off / catch-up), trend/structure checks only use last 1440 (1 day) via backfill + filters.
+# Full buffer allows accumulating 1 week + 4 days of candles before oldest are dropped on new appends.
+MAX_COMPLETED_BARS = 10080 + 4 * 1440  # 15840
+# M5: 15840 // 5 = 3168
 MAX_M5_BARS = MAX_COMPLETED_BARS // 5
 
 
@@ -155,7 +156,7 @@ def add_market_data(symbol: str, data: dict) -> None:
     symbol = _resolve_buffer_key(symbol)
 
     if symbol not in LIVE_BARS:
-        # maxlen = 1441 to hold 1440 (1 day) + 1 forming minute. New data always appends (drops oldest if full).
+        # maxlen = MAX+1 (15841) to hold 1w+4d history + forming. New market bars always appended (oldest dropped when full).
         LIVE_BARS[symbol] = deque(maxlen=MAX_COMPLETED_BARS + 1)
 
     TICK_STATS[symbol] = TICK_STATS.get(symbol, 0) + 1
@@ -319,24 +320,25 @@ def get_recent_closed_df(symbol: str, limit: Optional[int] = None) -> Optional[p
 
 def get_recent_df_for_structure(symbol: str, limit: Optional[int] = None) -> Optional[pd.DataFrame]:
     """
-    Convenience wrapper for structure analysis:
-    Prefer closed (non-forming) bars within the catch-up window (strict 1 day max).
-    Never uses >1d history for post-downtime trend/structure decisions (user-required rollback limit).
+    Convenience wrapper for structure analysis.
+    Uses full buffer (1 week + 4 days headroom). After system turns on, only 1440 initially available from backfill.
+    No forced 1-day cap for normal operation (buffer maxlen + backfill handle the post-off 1440 limit).
     """
     eff_limit = limit
     if eff_limit is None:
-        eff_limit = int(get_settings().catchup_max_m1_bars)
+        eff_limit = MAX_COMPLETED_BARS
     else:
-        eff_limit = min(eff_limit, int(get_settings().catchup_max_m1_bars))
+        eff_limit = min(eff_limit, MAX_COMPLETED_BARS)
 
     df = get_recent_closed_df(symbol, eff_limit)
     if df is None or (hasattr(df, "empty") and df.empty):
         df = get_recent_df(symbol, eff_limit)
-    return filter_df_to_catchup_window(df)
+    # No longer apply catchup filter here (would limit to 1d always). Post-off limited by available backfilled data.
+    return df
 
 
 def get_buffer_status(symbol: str) -> Dict[str, Any]:
-    """Debug / UI helper — includes both M1 and derived M5 buffer fill. Now strictly 1 day (1440 M1) direct from live market data, not DB. Displays will no longer show 8000+ candles."""
+    """Debug / UI helper — includes both M1 and derived M5 buffer fill. Buffer stores up to 1 week + 4 days headroom (15840 M1) before rewriting. After system on, trend/structure only 1440 (1 day) from market. Displays show actual stored vs cap."""
     symbol = _resolve_buffer_key(symbol)
     buf = LIVE_BARS.get(symbol, deque())
     count = len(buf)
@@ -355,7 +357,7 @@ def get_buffer_status(symbol: str) -> Dict[str, Any]:
         "ticks_received": TICK_STATS.get(symbol, 0),
         "bars_completed": max(0, count - 1),
         "forming_bar": last,
-        "note": "bars_in_buffer can reach MAX+1 (1441) to include the current forming minute. New market bars are ALWAYS processed and appended (deque auto-drops oldest when full). This is a rolling 1-day window from live market data."
+        "note": "bars_in_buffer can reach up to MAX+1 (15841) for 1w+4d + forming. New market bars ALWAYS processed/appended (deque drops oldest when full). After off, trend/structure capped to 1440 via backfill/filters. Full buffer for normal op."
     }
 
 

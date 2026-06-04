@@ -128,7 +128,7 @@ def get_data_count(symbol: str = None, timeframe: str = None):
                 "candle_count": count,
                 "ready_for_default_structure": count >= 30,
                 "ready_for_min_8 (what your EA uses)": count >= 8,
-                "note": "Data directly from live market buffer (EA payloads), not DB. Strictly limited to last 1 day (1440 M1 candles max). No more 8000+ candles.",
+                "note": "Data directly from live market buffer (EA payloads), not DB. Buffer: 1 week +4d headroom (15840) before rewrite. Post-off: only 1440 for trend. No 8k+.",
                 "buffer_status": status,
                 "source": "live_market_buffer"
             }
@@ -138,8 +138,9 @@ def get_data_count(symbol: str = None, timeframe: str = None):
             return {
                 "all_live_market_buffers": lengths,
                 "tracked": tracked,
-                "note": "Live M1 candle counts directly from the market (not DB). Capped at 1 day (1440).",
+                "note": "Live M1 counts from market buffer (1w +4d headroom=15840 before rewrite). Post-off initial 1440 for trend.",
                 "max_per_day": 1440,
+                "full_buffer": 15840,
                 "source": "live_market_buffer"
             }
     except Exception as e:

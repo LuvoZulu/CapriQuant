@@ -86,7 +86,7 @@ def fetch_buffer():
 status = fetch_status()
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Backend", status.get("status", "down"))
-col2.metric("Max M1 Buffer (1 day)", status.get("buffer_max_m1", 1440))
+col2.metric("Max M1 Buffer (1w+4d)", status.get("buffer_max_m1", 1440))
 tracked = status.get("symbols_tracked", [])
 col3.metric("Symbols tracked", len(tracked))
 col4.metric("Last poll", datetime.utcnow().strftime("%H:%M:%S"))
@@ -96,7 +96,7 @@ st.caption(f"Backend: {BACKEND}  GÇó  Tracked: {', '.join(tracked) if tracked el
 # =============================================================================
 # LIVE SYMBOL CARDS + CURRENT STRUCTURE
 # =============================================================================
-st.subheader("Live Market Structure (from rolling 1-day / 1440 M1-bar buffer — direct from market)")
+st.subheader("Live Market Structure (from rolling buffer: 1 week + 4 days headroom before rewrite; post-off trend capped to 1440/1 day from market)")
 
 card_cols = st.columns(len(SYMBOLS))
 for i, sym in enumerate(SYMBOLS):
@@ -172,7 +172,7 @@ else:
 with st.expander("Live Buffer & System Details"):
     buf = fetch_buffer()
     st.json(buf)
-    st.caption("The backend maintains a rolling 1440 M1 bar buffer (strict 1 day from the LIVE MARKET, not DB) per symbol. This enforces the 1-day limit for trend/structure checks after the system was off. No 8000+ candles.")
+    st.caption("The backend maintains a rolling buffer (1 week of candles + space for another 4 days before rewriting). After system turns on, trend/structure checks only use last 1440 (1 day) from market/backfill. Displays show actual buffer fill.")
 
 # =============================================================================
 # AUTO REFRESH
@@ -182,4 +182,5 @@ if auto_refresh:
     st.rerun()
 
 st.caption("Tip: Leave this tab open during the trading day. The backend Windows service keeps running on weekdays even if you close the UI.")
+
 

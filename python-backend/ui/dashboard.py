@@ -149,7 +149,7 @@ def fetch_open_trades(symbol=None, limit=50):
 status = fetch_status()
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Backend", status.get("status", "down"))
-col2.metric("Max M1 Buffer (1 day)", status.get("buffer_max_m1", 1440))
+col2.metric("Max M1 Buffer (1w+4d)", status.get("buffer_max_m1", 15840))
 tracked = status.get("symbols_tracked", [])
 col3.metric("Symbols tracked", len(tracked))
 col4.metric("Last poll", datetime.utcnow().strftime("%H:%M:%S"))
@@ -159,7 +159,7 @@ st.caption(f"Backend: {BACKEND}  •  Tracked: {', '.join(tracked) if tracked el
 # =============================================================================
 # LIVE SYMBOL CARDS + CURRENT STRUCTURE
 # =============================================================================
-st.subheader("Live Market Structure (from rolling 1-day / 1440 M1-bar buffer — direct from market)")
+st.subheader("Live Market Structure (from rolling buffer: 1 week + 4 days headroom before rewrite; post-off trend capped to 1440/1 day from market)")
 
 card_cols = st.columns(len(SYMBOLS))
 for i, sym in enumerate(SYMBOLS):
@@ -188,7 +188,7 @@ for i, sym in enumerate(SYMBOLS):
         if "error" in snap or snap.get("status") == "insufficient_live_data":
             st.warning(snap.get("status", "No live data yet"))
             bcount = buf.get('effective_bars', buf.get('bars_in_buffer', 0))
-            st.caption(f"Buffer: {bcount}/{buf.get('max_bars', 1440)} (incl. current minute) — 1 day max")
+            st.caption(f"Buffer: {bcount}/{buf.get('max_bars', 15840)} (incl. current minute) — 1w+4d headroom")
             st.caption(f"**Readiness:** {readiness}")
             st.caption(readiness_desc)
         else:
@@ -201,7 +201,7 @@ for i, sym in enumerate(SYMBOLS):
             st.caption(f"Price: {snap.get('current_price')}")
             bcount = buf.get('effective_bars', buf.get('bars_in_buffer', 0))
             st.progress(min(buf.get("pct_full", 0) / 100, 1.0))
-            st.caption(f"Live buffer: {bcount} bars ({buf.get('pct_full', 0)}%) (incl. current minute) — capped at 1 day")
+            st.caption(f"Live buffer: {bcount} bars ({buf.get('pct_full', 0)}%) (incl. current minute) — 1w+4d before rewrite")
 
             # M5 progress (key for trends/structure)
             st.caption("M5 buffer (structure trends)")
@@ -278,7 +278,7 @@ with st.expander("Live Buffer & System Details"):
                 level = "✅ Strong"
             label = DISPLAY_NAMES.get(sym, sym)
             st.write(f"**{label}:** {level} ({m5c} M5 bars)")
-    st.caption("The backend maintains a rolling 1440 M1 bar buffer (strict 1 day from the LIVE MARKET, not DB) per symbol. This enforces the 1-day limit for trend/structure checks after the system was off. No 8000+ candles. Readiness tiers: <3 M5=Insufficient, 3-7=Basic, 8-19=Good, 20+=Strong.")
+    st.caption("The backend maintains a rolling buffer (1 week of candles + space for another 4 days before rewriting). After system turns on, trend/structure checks only use last 1440 (1 day) from market/backfill. Displays show actual buffer fill. Readiness tiers: <3 M5=Insufficient, 3-7=Basic, 8-19=Good, 20+=Strong.")
 
 # =============================================================================
 # RUNNING TRADES (added at bottom as requested - keeps all previous UI intact)

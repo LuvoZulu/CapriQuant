@@ -408,7 +408,7 @@ def debug_live_buffer_all():
     from app.live_data import get_all_buffer_lengths
     return {
         "live_buffer_counts": get_all_buffer_lengths(),
-        "note": "These are the number of recent M1 bars (completed + current) kept in memory — strictly 1 day max (1440) direct from market/live buffer (not DB). For real-time structure analysis per user request."
+        "note": "Number of recent M1 bars kept in memory (buffer caps at 1w+4d=15840 before rewrite). Post-off trend/structure uses only 1440 (1 day) from market. Direct from market."
     }
 
 
@@ -416,7 +416,7 @@ def debug_live_buffer_all():
 def debug_live_buffer_symbol(symbol: str):
     """Returns detailed information about the live buffer for one symbol."""
     info = live_buffer.get_buffer_status(symbol)
-    info["note"] = "This shows how much recent live data (1 day / 1440 M1 max, direct from market) is available for real-time decision making. Enforces no 8k+ candles."
+    info["note"] = "Recent live data from market buffer (grows to 1w+4d=15840 before rewrite). After off, only 1440 for trend/structure. Direct from market, no DB."
     return info
 
 
@@ -523,7 +523,7 @@ def api_health():
         "mode": get_system_mode(),
         "tracked": syms,
         "buffers_ok": buffers_ok,
-        "note": "1-day buffer limit (1440 M1 from live market, not DB) enforced for trend/structure/rollback after off. Fixes for execution, signals mode, r calc applied."
+        "note": "Buffer: 1 week (10080) + 4 days headroom (15840 total) before rewrite. Post-off: trend/structure only 1440 (1 day) from market/backfill. Direct from market for displays."
     }
 
 @app.get("/api/system-status")
@@ -535,8 +535,8 @@ def api_system_status():
         "version": "post-fix",
         "timestamp": datetime.utcnow().isoformat(),
         "mode": get_system_mode(),
-        "buffer_max_m1": getattr(live_buffer, 'max_bars', 1440),
-        "buffer_max_m5": getattr(live_buffer, 'max_m5_bars', 288),
+        "buffer_max_m1": getattr(live_buffer, 'max_bars', 15840),
+        "buffer_max_m5": getattr(live_buffer, 'max_m5_bars', 3168),
         "catchup_max_hours": get_settings().catchup_max_hours,
         "catchup_max_m1_bars": get_settings().catchup_max_m1_bars,
         "symbols_tracked": syms,
