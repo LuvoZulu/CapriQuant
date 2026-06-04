@@ -54,11 +54,9 @@ ulong    lastDataSendTime = 0;   // For throttling data sends
 ulong    g_knownOpenTickets[];
 ulong    g_reportedClosedTickets[];
 
-// Backfill / catch-up after downtime (PC off, restart, missed Asian etc.)
-// We persist the last successfully sent M1 bar time to a file so on next EA start
-// we can detect the gap and ask MT5 for the missing candles, send them as backfill
-// so the Python backend can fill its buffers + DB. This makes structure/AMD "see"
-// what happened while the system was off, without blind spots.
+// Backfill / catch-up after downtime (PC off, restart).
+// Max lookback is 1 day only — never pull weeks of history on restart.
+#define BACKFILL_MAX_SECONDS (24 * 3600)
 datetime g_lastBackfillTime = 0;
 bool     g_backfillDone     = false;
 
@@ -116,77 +114,37 @@ void SendHistoricalBar(const MqlRates &r)
 }
 
 //+------------------------------------------------------------------+
-//| Helper: calculate start time for full previous sessions context  |
-//| If turning on during NY, ensure we have London + Asian data.     |
-//| Calculates based on current phase + conservative lookback.       |
-//| This + gap from last run = "fetch everything in between" + full  |
-//| prior sessions for AMD/structure.                                |
+//| Earliest bar time allowed for catch-up (never older than 1 day)  |
 //+------------------------------------------------------------------+
-datetime GetRequiredContextStart(datetime now)
+datetime GetMaxBackfillStart(datetime now)
 {
-   // Conservative: at least last 24h to cover full Asian + London + NY overlap.
-   datetime min_24h = now - 24 * 3600;
-
-   // Align to a previous Asian/overnight start (22:00 or 00:00 previous day).
-   // This ensures when in NY we pull the full prior Asian (and London).
-   MqlDateTime dt;
-   TimeToStruct(now, dt);
-
-   // Previous ~22:00 (common Asian start for Gold/Forex)
-   dt.hour = 22; dt.min = 0; dt.sec = 0;
-   datetime asian22 = StructToTime(dt);
-   if (now < asian22) asian22 -= 86400;
-
-   // Previous 00:00 (overnight start for indices)
-   dt.hour = 0;
-   datetime asian00 = StructToTime(dt);
-   if (now < asian00) asian00 -= 86400;
-
-   // Take the earliest sensible start (covers full sessions)
-   datetime context = min_24h;
-   if (asian22 < context) context = asian22;
-   if (asian00 < context) context = asian00;
-
-   // Safety cap: don't go crazy far on first run (max ~36h)
-   if (now - context > 36 * 3600) context = now - 36 * 3600;
-
-   return context;
+   return now - BACKFILL_MAX_SECONDS;
 }
 
 //+------------------------------------------------------------------+
-//| Catch-up backfill: when EA (re)starts after being off, fetch the |
-//| M1 bars that were missed and send them so backend buffers + DB   |
-//| contain continuous history. This lets structure/AMD "see" what   |
-//| formed during the gap (e.g. full Asian session) and makes the    |
-//| current state accurate instead of cold-start blind spot.         |
-//|                                                                  |
-//| Enhanced: always ensures full prior London + Asian if turning on |
-//| during NY (or equivalent for the symbol). Calculates effective   |
-//| "turn off" (lastBackfillTime) vs "turn on" (now) and fetches     |
-//| everything in between + required session context.                |
-//| We are now explicitly doing the "calculate off/on + full         |
-//| sessions in between" as requested.                               |
+//| Catch-up backfill: fill only the gap since last sync, capped at  |
+//| 1 calendar day. If the system was off longer, trend uses at most   |
+//| the last 24h — avoids huge historical rollbacks.                 |
 //+------------------------------------------------------------------+
 void DoBackfillIfNeeded()
 {
    if(g_backfillDone) return;
 
    datetime now = TimeCurrent();
-   datetime required = GetRequiredContextStart(now);
+   datetime earliest_allowed = GetMaxBackfillStart(now);
 
    int m1_sec = PeriodSeconds(PERIOD_M1);
    datetime from;
    if(g_lastBackfillTime == 0)
    {
-      // First run: start from the required full context (guarantees Asian+London etc.)
-      from = required;
+      from = earliest_allowed;
    }
    else
    {
       datetime gap_from = g_lastBackfillTime + m1_sec;
-      // Use the earlier (further back) of gap or required context.
-      // This way small gaps during day still pull full prior sessions if needed.
-      from = (gap_from < required ? gap_from : required);
+      from = gap_from;
+      if(from < earliest_allowed)
+         from = earliest_allowed;
    }
 
    if(from >= now)
@@ -198,15 +156,15 @@ void DoBackfillIfNeeded()
 
    // How many bars to request this chunk (cap to avoid huge single WebRequest storms)
    int needed = (int)((now - from) / m1_sec) + 5;
-   int chunk  = MathMin(needed, 500);   // allow larger chunks for session backfills
+   int chunk  = MathMin(needed, 500);
 
    MqlRates rates[];
    int copied = CopyRates(currentSymbol, PERIOD_M1, from, chunk, rates);
    if(copied <= 0)
       return; // will retry next timer
 
-   Print("[CapriQuant BACKFILL] Sending ", copied, " historical M1 bars for gap/context starting ", TimeToString(from),
-         " (required full sessions for current phase)");
+   Print("[CapriQuant BACKFILL] Sending ", copied, " M1 bars from ", TimeToString(from),
+         " (max lookback 1 day, gap since ", (g_lastBackfillTime>0 ? TimeToString(g_lastBackfillTime) : "first run"), ")");
 
    int sent = 0;
    for(int i = 0; i < copied; i++)
@@ -225,7 +183,6 @@ void DoBackfillIfNeeded()
    else
       Print("[CapriQuant BACKFILL] Partial catch-up for ", currentSymbol, " - will continue on next timer.");
 
-   // After backfill chunk(s), the live OnTick data + structure will have full prior sessions (Asian/London) + gap.
 }
 
 //+------------------------------------------------------------------+
