@@ -175,13 +175,12 @@ def get_mtf_structure_signal(
     max_m1 = MAX_COMPLETED_BARS
     df_m1_full = live_buffer.get_recent_df(symbol, limit=max_m1)
     # No longer force 1-day filter here for normal ops; post-off limited by backfill amount.
-    # if df_m1_full is None or len(df_m1_full) < min_candles_m1:
     if df_m1_full is None or len(df_m1_full) < min_candles_m1:
         return None
 
     current_price = float(df_m1_full["close"].iloc[-1])
 
-    # For closed bars, use recent from full buffer (structure will see up to 1w history normally)
+    # For closed bars, use recent from full buffer (structure sees up to 1w+4d history normally; post-off starts at 1440)
     df_m1 = live_buffer.get_recent_closed_df(symbol, limit=max_m1)
     if df_m1 is None or (hasattr(df_m1, 'empty') and df_m1.empty):
         df_m1 = (df_m1_full.iloc[:-1].reset_index(drop=True) if len(df_m1_full) > 1 else df_m1_full)
@@ -191,8 +190,7 @@ def get_mtf_structure_signal(
     if df_m5 is None or df_m5.empty:
         df_m5 = resample_ohlcv(df_m1_full, minutes=5)
     df_m15 = resample_ohlcv(df_m1_full, minutes=15)
-    # Removed catchup filters here so normal structure can use full 1w+ history from buffer.
-    # (Post-off still limited because only 1440 backfilled initially.)
+    # No catchup filters so normal structure uses full buffer history (1w+4d). Post-off limited because backfill only 1440 initially.
 
     # Use only completed (closed) bars for higher TF structure to avoid noise from forming candle (fixes 0 swings)
     if len(df_m5) > 1:
