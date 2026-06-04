@@ -21,7 +21,6 @@ from app.features.structure import MarketStructure, OrderBlock
 # Import the fully rewritten contextual analyzers
 from app.strategies import amd, fibonacci, price_action, liquidity, crt
 from app.config import get_settings
-from app.utils.signal_logger import log_signal
 
 
 def generate_structure_summary(ms: MarketStructure) -> str:
@@ -184,7 +183,8 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
     Goals:
     - Positive expectancy with controlled drawdowns across regimes
     - Respect higher-timeframe structure and BOS (don't fight the trend)
-    - Take more trades than ultra-strict reversal-only mode (target 30-80+/year)
+    - Take more trades than ultra-strict reversal-only mode.
+    - Thresholds lowered (user request) → expect higher frequency (potentially 100+/year) at cost of some edge.
     - Don't miss strong trends (add continuation setups)
     - Still require real structure (not random scalping)
 
@@ -238,14 +238,14 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
             for b in ms.breaks[-6:]
         )
 
-        # Only hard veto if no BOS + very weak confluence
-        if not has_supporting_bos and total_confluence < 0.65:
+        # Only hard veto if no BOS + very weak confluence (adjusted with lower overall min_confluence)
+        if not has_supporting_bos and total_confluence < 0.50:
             return "No recent BOS + weak confluence"
 
-        # Respect HTF bias (Option C) but not as absolute
-        if ms.bias == "BEARISH" and direction == "BUY" and total_confluence < 1.1:
+        # Respect HTF bias (Option C) but not as absolute (adjusted)
+        if ms.bias == "BEARISH" and direction == "BUY" and total_confluence < 0.90:
             return "Against bearish market structure"
-        if ms.bias == "BULLISH" and direction == "SELL" and total_confluence < 1.1:
+        if ms.bias == "BULLISH" and direction == "SELL" and total_confluence < 0.90:
             return "Against bullish market structure"
 
         return None
@@ -340,7 +340,7 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
     # ------------------------------------------------------------------
     # NEW SETUP 3: Trend Continuation (to avoid missing strong moves)
     # ------------------------------------------------------------------
-    if ms.bias == "BULLISH" and total_confluence > 0.55:
+    if ms.bias == "BULLISH" and total_confluence > 0.45:
         # Price has made higher highs/lows and is pulling back to minor structure
         has_bull_bos = any(b.break_type == "BOS" and b.direction == "BULL" for b in ms.breaks[-4:])
         minor_pullback = any(abs(price - ob.high) < atr * 0.6 for ob in ms.order_blocks if ob.ob_type == "BULLISH" and not ob.is_mitigated)
@@ -361,7 +361,7 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
                     veto_reason=veto,
                 ))
 
-    if ms.bias == "BEARISH" and total_confluence < -0.55:
+    if ms.bias == "BEARISH" and total_confluence > 0.45:
         has_bear_bos = any(b.break_type == "BOS" and b.direction == "BEAR" for b in ms.breaks[-4:])
         minor_pullback = any(abs(price - ob.low) < atr * 0.6 for ob in ms.order_blocks if ob.ob_type == "BEARISH" and not ob.is_mitigated)
 
@@ -440,8 +440,8 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
     # ------------------------------------------------------------------
     valid = [s for s in setups if not s.veto_reason]
 
-    # Keep decent conviction setups
-    valid = [s for s in valid if s.score >= 0.65]
+    # Keep decent conviction setups (lowered with overall thresholds)
+    valid = [s for s in valid if s.score >= 0.55]
 
     # Prefer higher conviction
     valid.sort(key=lambda s: -s.score)
@@ -521,11 +521,5 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
             {"name": s.name, "direction": s.direction, "score": round(s.score, 2)} for s in setups
         ],
     }
-
-    # Log every signal for future analysis
-    try:
-        log_signal(result)
-    except Exception:
-        pass
 
     return result

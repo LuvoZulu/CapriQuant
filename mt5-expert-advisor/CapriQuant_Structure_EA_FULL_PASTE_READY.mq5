@@ -34,7 +34,7 @@ input int      DataSendIntervalMs   = 800;                // Minimum time betwee
 input string   DataTimeframe        = "M1";               // Timeframe to send detailed OHLC for (M1 recommended for real-time)
 input string   SignalTimeframe      = "M5";               // Timeframe to request signal on
 
-input double   MinConfidence        = 68.0;
+input double   MinConfidence        = 65.0;  // lowered for more trades (user request); was 68.0
 input double   RiskPercent          = 1.8;                // Fallback. Server can override via risk_pct in response
 input int      MaxTradesPerDay      = 30;
 input double   MaxSpreadPoints      = 400;
@@ -54,11 +54,9 @@ ulong    lastDataSendTime = 0;   // For throttling data sends
 ulong    g_knownOpenTickets[];
 ulong    g_reportedClosedTickets[];
 
-// Backfill / catch-up after downtime (PC off, restart, missed Asian etc.)
-// We persist the last successfully sent M1 bar time to a file so on next EA start
-// we can detect the gap and ask MT5 for the missing candles, send them as backfill
-// so the Python backend can fill its buffers + DB. This makes structure/AMD "see"
-// what happened while the system was off, without blind spots.
+// Backfill / catch-up after downtime (PC off, restart).
+// Max lookback is 1 day only — never pull weeks of history on restart.
+#define BACKFILL_MAX_SECONDS (24 * 3600)
 datetime g_lastBackfillTime = 0;
 bool     g_backfillDone     = false;
 
@@ -116,25 +114,39 @@ void SendHistoricalBar(const MqlRates &r)
 }
 
 //+------------------------------------------------------------------+
-//| Catch-up backfill: when EA (re)starts after being off, fetch the |
-//| M1 bars that were missed and send them so backend buffers + DB   |
-//| contain continuous history. This lets structure/AMD "see" what   |
-//| formed during the gap (e.g. full Asian session) and makes the    |
-//| current state accurate instead of cold-start blind spot.         |
+//| Earliest bar time allowed for catch-up (never older than 1 day)  |
+//+------------------------------------------------------------------+
+datetime GetMaxBackfillStart(datetime now)
+{
+   return now - BACKFILL_MAX_SECONDS;
+}
+
+//+------------------------------------------------------------------+
+//| Catch-up backfill: fill only the gap since last sync, capped at  |
+//| 1 calendar day. If the system was off longer, trend uses at most   |
+//| the last 24h — avoids huge historical rollbacks.                 |
 //+------------------------------------------------------------------+
 void DoBackfillIfNeeded()
 {
    if(g_backfillDone) return;
 
    datetime now = TimeCurrent();
-   if(g_lastBackfillTime == 0)
-   {
-      // First run ever for this symbol - seed a reasonable window (e.g. last ~8-12h)
-      g_lastBackfillTime = now - (PeriodSeconds(PERIOD_M1) * 600);
-   }
+   datetime earliest_allowed = GetMaxBackfillStart(now);
 
    int m1_sec = PeriodSeconds(PERIOD_M1);
-   datetime from = g_lastBackfillTime + m1_sec;
+   datetime from;
+   if(g_lastBackfillTime == 0)
+   {
+      from = earliest_allowed;
+   }
+   else
+   {
+      datetime gap_from = g_lastBackfillTime + m1_sec;
+      from = gap_from;
+      if(from < earliest_allowed)
+         from = earliest_allowed;
+   }
+
    if(from >= now)
    {
       g_backfillDone = true;
@@ -144,18 +156,21 @@ void DoBackfillIfNeeded()
 
    // How many bars to request this chunk (cap to avoid huge single WebRequest storms)
    int needed = (int)((now - from) / m1_sec) + 5;
-   int chunk  = MathMin(needed, 400);   // ~6-7 hours per timer call max; will continue if more
+   int chunk  = MathMin(needed, 500);
 
    MqlRates rates[];
    int copied = CopyRates(currentSymbol, PERIOD_M1, from, chunk, rates);
    if(copied <= 0)
       return; // will retry next timer
 
-   Print("[CapriQuant BACKFILL] Sending ", copied, " historical M1 bars for gap starting ", TimeToString(from));
+   Print("[CapriQuant BACKFILL] Sending ", copied, " M1 bars from ", TimeToString(from),
+         " (max lookback 1 day, gap since ", (g_lastBackfillTime>0 ? TimeToString(g_lastBackfillTime) : "first run"), ")");
 
    int sent = 0;
    for(int i = 0; i < copied; i++)
    {
+      if(rates[i].time < earliest_allowed)
+         continue;
       SendHistoricalBar(rates[i]);
       g_lastBackfillTime = rates[i].time;
       sent++;
@@ -164,13 +179,12 @@ void DoBackfillIfNeeded()
 
    SaveLastSyncTime(g_lastBackfillTime);
 
-   // Are we caught up?
+   // Are we caught up to now?
    if((g_lastBackfillTime + m1_sec) >= (now - 60))
       g_backfillDone = true;
    else
       Print("[CapriQuant BACKFILL] Partial catch-up for ", currentSymbol, " - will continue on next timer.");
 
-   // After backfill chunk, the live OnTick data will resume with full context in backend.
 }
 
 //+------------------------------------------------------------------+
@@ -186,6 +200,13 @@ int OnInit()
 
    // Load last sent bar time (persisted across EA restarts / terminal restarts)
    g_lastBackfillTime = LoadLastSyncTime();
+   datetime earliest = GetMaxBackfillStart(TimeCurrent());
+   if(g_lastBackfillTime > 0 && g_lastBackfillTime < earliest)
+   {
+      Print("[CapriQuant BACKFILL] last_sync older than 1 day — clamping to ", TimeToString(earliest));
+      g_lastBackfillTime = earliest;
+      SaveLastSyncTime(g_lastBackfillTime);
+   }
    g_backfillDone = false;
 
    Print("================================================================");
@@ -315,7 +336,9 @@ void SendMarketDataRealtime()
    uchar result_data[];
    string response_headers;
 
-   WebRequest("POST", ServerURL + "/market-data", headers, httpTimeout, post_data, result_data, response_headers);
+   int httpRes = WebRequest("POST", ServerURL + "/market-data", headers, httpTimeout, post_data, result_data, response_headers);
+   if(httpRes == 200)
+      ProcessRealtimeMarketDataResponse(CharArrayToString(result_data));
 }
 
 // (backfill helpers are defined earlier, right after globals, to avoid MQL5 forward reference issues)
@@ -327,8 +350,9 @@ string GetStructureSignal(string tf)
 {
    double spreadPoints = (SymbolInfoDouble(currentSymbol, SYMBOL_ASK) - SymbolInfoDouble(currentSymbol, SYMBOL_BID)) / _Point;
 
-   string url = StringFormat("%s/signal/%s/%s?engine=structure&min_candles=8&spread=%.1f",
-                             ServerURL, currentSymbol, tf, spreadPoints);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   string url = StringFormat("%s/signal/%s/%s?engine=structure&min_candles=8&spread=%.1f&equity=%.2f",
+                             ServerURL, currentSymbol, tf, spreadPoints, equity);
 
    uchar  dummy[];
    uchar  result[];
@@ -427,6 +451,12 @@ void ProcessSignalResponse(string json)
 
    if(confidence < MinConfidence) return;
 
+   if(stop <= 0.0)
+   {
+      Print("[CapriQuant] Reject trade: missing valid stop from server (setup=", setup, ")");
+      return;
+   }
+
    double spread = (SymbolInfoDouble(currentSymbol, SYMBOL_ASK) - SymbolInfoDouble(currentSymbol, SYMBOL_BID)) / _Point;
    if(spread > MaxSpreadPoints) return;
 
@@ -436,7 +466,7 @@ void ProcessSignalResponse(string json)
    double effRisk = RiskPercent;
    if(server_risk_pct > 0.1) effRisk = server_risk_pct;
 
-   double lots = CalculateLots(stop, effRisk);
+   double lots = CalculateLots(stop, effRisk, signalDir);
    if(lots <= 0) return;
 
    ulong ticket = ExecuteTrade(signalDir, lots, stop, tp1, tp2, setup);
@@ -571,14 +601,19 @@ void CloseAllPositions(string reason = "kill_switch")
    }
 }
 
-// CalculateLots now accepts optional riskPct so we can use server value without touching the input
-double CalculateLots(double stopPrice, double riskPct = -1.0)
+// CalculateLots: direction-aware entry price + valid stop required
+double CalculateLots(double stopPrice, double riskPct = -1.0, string direction = "BUY")
 {
    if(riskPct <= 0.0) riskPct = RiskPercent;
 
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskMoney = equity * (riskPct / 100.0);
-   double entry = SymbolInfoDouble(currentSymbol, SYMBOL_ASK);
+   double entry = (direction == "BUY")
+      ? SymbolInfoDouble(currentSymbol, SYMBOL_ASK)
+      : SymbolInfoDouble(currentSymbol, SYMBOL_BID);
+
+   if(stopPrice <= 0.0)
+      return 0.0;
 
    double stopDist = MathAbs(entry - stopPrice);
    if(stopDist < 0.00001) stopDist = SymbolInfoDouble(currentSymbol, SYMBOL_POINT) * 80;
@@ -613,7 +648,77 @@ ulong ExecuteTrade(string direction, double lots, double sl, double tp1, double 
       Print("[CapriQuant] OrderSend FAILED: ", res.retcode, " - ", res.comment);
       return 0;
    }
-   return res.order;
+   ulong ticket = res.position;
+   if(ticket == 0) ticket = res.order;
+   if(ticket == 0) ticket = res.deal;
+   return ticket;
+}
+
+string ExtractNestedObject(string json, string key)
+{
+   string k = "\"" + key + "\":{";
+   int p = StringFind(json, k);
+   if(p < 0) return "";
+   int start = p + StringLen(k) - 1;
+   int depth = 0;
+   for(int i = start; i < StringLen(json); i++)
+   {
+      ushort ch = (ushort)StringGetCharacter(json, i);
+      if(ch == '{') depth++;
+      else if(ch == '}')
+      {
+         depth--;
+         if(depth == 0)
+            return StringSubstr(json, start, i - start + 1);
+      }
+   }
+   return "";
+}
+
+void ProcessRealtimeMarketDataResponse(string fullResp)
+{
+   if(fullResp == "") return;
+
+   string sigJson = ExtractNestedObject(fullResp, "signal");
+   string sdir = "";
+
+   if(sigJson != "")
+      sdir = ExtractJsonString(sigJson, "signal");
+   if(sdir == "")
+      sdir = ExtractJsonString(fullResp, "sig_dir");
+
+   if(sdir == "FLATTEN" || ExtractJsonString(fullResp, "system_mode") == "flatten")
+   {
+      ProcessSignalResponse("{\"signal\":\"FLATTEN\",\"system_mode\":\"flatten\",\"action\":\"flatten_all\"}");
+      return;
+   }
+
+   if(sdir != "BUY" && sdir != "SELL") return;
+
+   if(sigJson == "")
+   {
+      double sconf = ExtractJsonDouble(fullResp, "sig_confidence");
+      string ssetup = ExtractJsonString(fullResp, "sig_setup");
+      string srat = ExtractJsonString(fullResp, "sig_rationale");
+      double sstop = ExtractJsonDouble(fullResp, "sig_stop_suggestion");
+      double stp1 = ExtractJsonDouble(fullResp, "sig_tp1");
+      double stp2 = ExtractJsonDouble(fullResp, "sig_tp2");
+      sigJson = StringFormat("{\"signal\":\"%s\",\"confidence\":%.1f,\"setup\":\"%s\",\"rationale\":\"%s\",\"stop_suggestion\":%.5f,\"tp1\":%.5f,\"tp2\":%.5f}",
+         sdir, sconf, ssetup, srat, sstop, stp1, stp2);
+   }
+
+   string merged = StringSubstr(sigJson, 0, StringLen(sigJson)-1);
+   double rpct = ExtractJsonDouble(fullResp, "risk_pct");
+   if(rpct > 0) merged += StringFormat(",\"risk_pct\":%.4f", rpct);
+   double vstop = ExtractJsonDouble(fullResp, "validated_stop");
+   if(vstop > 0) merged += StringFormat(",\"validated_stop\":%.5f", vstop);
+   string smode = ExtractJsonString(fullResp, "system_mode");
+   if(smode != "") merged += StringFormat(",\"system_mode\":\"%s\"", smode);
+   string act = ExtractJsonString(fullResp, "action");
+   if(act != "") merged += StringFormat(",\"action\":\"%s\"", act);
+   merged += "}";
+
+   ProcessSignalResponse(merged);
 }
 
 string ExtractJsonString(string json, string key)

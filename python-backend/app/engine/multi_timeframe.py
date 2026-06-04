@@ -17,7 +17,8 @@ from app.engine.confluence import (
     generate_structure_summary,
     apply_m5_risk_levels,
 )
-from app.live_data import live_buffer, resample_ohlcv
+from app.live_data import live_buffer, resample_ohlcv, filter_df_to_catchup_window
+from app.config import get_settings
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
 from app.config import get_settings
@@ -168,21 +169,26 @@ def get_mtf_structure_signal(
     Returns None if insufficient live data.
     equity: optional live equity for RiskManager hard veto (account-level circuits).
     """
-    df_m1_full = live_buffer.get_recent_df(symbol, limit=10080)
+    max_m1 = int(get_settings().catchup_max_m1_bars)
+    df_m1_full = live_buffer.get_recent_df(symbol, limit=max_m1)
+    df_m1_full = filter_df_to_catchup_window(df_m1_full)
     if df_m1_full is None or len(df_m1_full) < min_candles_m1:
         return None
 
     current_price = float(df_m1_full["close"].iloc[-1])
 
-    # Prefer closed bars for structure (robust against empty DataFrame truth-value issues)
-    df_m1 = live_buffer.get_recent_df_for_structure(symbol, limit=10080)
+    # Prefer closed bars for structure (last 24h only — no deep rollback after downtime)
+    df_m1 = live_buffer.get_recent_df_for_structure(symbol, limit=max_m1)
     if df_m1 is None or (hasattr(df_m1, 'empty') and df_m1.empty):
         df_m1 = (df_m1_full.iloc[:-1].reset_index(drop=True) if len(df_m1_full) > 1 else df_m1_full)
 
-    df_m5 = live_buffer.get_recent_m5_df(symbol, limit=live_buffer.max_m5_bars)
+    max_m5 = max(3, max_m1 // 5)
+    df_m5 = live_buffer.get_recent_m5_df(symbol, limit=max_m5)
     if df_m5 is None or df_m5.empty:
         df_m5 = resample_ohlcv(df_m1_full, minutes=5)
     df_m15 = resample_ohlcv(df_m1_full, minutes=15)
+    df_m5 = filter_df_to_catchup_window(df_m5) if df_m5 is not None else df_m5
+    df_m15 = filter_df_to_catchup_window(df_m15) if df_m15 is not None else df_m15
 
     # Use only completed (closed) bars for higher TF structure to avoid noise from forming candle (fixes 0 swings)
     if len(df_m5) > 1:
