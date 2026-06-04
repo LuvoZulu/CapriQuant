@@ -200,7 +200,7 @@ Alternative (pure Python service without NSSM) is commented inside `run_as_windo
 
 ## Running the UI / Visualizer (Streamlit Dashboard)
 
-The UI lets you watch live system progress, buffer status (10080 M1 bars), per-symbol market structure cards, signal build-up history (with charts), and executed trades.
+The UI lets you watch live system progress, buffer status (1440 M1 bars = strict 1 day, direct from live market not DB), per-symbol market structure cards, signal build-up history (with charts), and executed trades.
 
 ### Steps
 

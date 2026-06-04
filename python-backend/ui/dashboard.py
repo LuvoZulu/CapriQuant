@@ -5,7 +5,7 @@ Launch with:
     streamlit run python-backend/ui/dashboard.py
 
 Features:
-- System status + live buffer fill (10080 M1 target)
+- System status + live buffer fill (1440 M1 = strict 1 day target, from market not DB)
 - Per-symbol cards with current bias, structure_summary, active OBs, swing count
 - Signal history table + simple progress charts (score over time per symbol)
 - Trades section (from executed_trades reported by the EA)
@@ -149,7 +149,7 @@ def fetch_open_trades(symbol=None, limit=50):
 status = fetch_status()
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Backend", status.get("status", "down"))
-col2.metric("Max M1 Buffer", status.get("buffer_max_m1", 10080))
+col2.metric("Max M1 Buffer (1 day)", status.get("buffer_max_m1", 1440))
 tracked = status.get("symbols_tracked", [])
 col3.metric("Symbols tracked", len(tracked))
 col4.metric("Last poll", datetime.utcnow().strftime("%H:%M:%S"))
@@ -159,7 +159,7 @@ st.caption(f"Backend: {BACKEND}  •  Tracked: {', '.join(tracked) if tracked el
 # =============================================================================
 # LIVE SYMBOL CARDS + CURRENT STRUCTURE
 # =============================================================================
-st.subheader("Live Market Structure (from rolling 10080-bar buffer)")
+st.subheader("Live Market Structure (from rolling 1-day / 1440 M1-bar buffer — direct from market)")
 
 card_cols = st.columns(len(SYMBOLS))
 for i, sym in enumerate(SYMBOLS):
@@ -188,7 +188,7 @@ for i, sym in enumerate(SYMBOLS):
         if "error" in snap or snap.get("status") == "insufficient_live_data":
             st.warning(snap.get("status", "No live data yet"))
             bcount = buf.get('effective_bars', buf.get('bars_in_buffer', 0))
-            st.caption(f"Buffer: {bcount}/{buf.get('max_bars', 10080)} (incl. current minute)")
+            st.caption(f"Buffer: {bcount}/{buf.get('max_bars', 1440)} (incl. current minute) — 1 day max")
             st.caption(f"**Readiness:** {readiness}")
             st.caption(readiness_desc)
         else:
@@ -201,7 +201,7 @@ for i, sym in enumerate(SYMBOLS):
             st.caption(f"Price: {snap.get('current_price')}")
             bcount = buf.get('effective_bars', buf.get('bars_in_buffer', 0))
             st.progress(min(buf.get("pct_full", 0) / 100, 1.0))
-            st.caption(f"Live buffer: {bcount} bars ({buf.get('pct_full', 0)}%) (incl. current minute)")
+            st.caption(f"Live buffer: {bcount} bars ({buf.get('pct_full', 0)}%) (incl. current minute) — capped at 1 day")
 
             # M5 progress (key for trends/structure)
             st.caption("M5 buffer (structure trends)")
@@ -278,7 +278,7 @@ with st.expander("Live Buffer & System Details"):
                 level = "✅ Strong"
             label = DISPLAY_NAMES.get(sym, sym)
             st.write(f"**{label}:** {level} ({m5c} M5 bars)")
-    st.caption("The backend maintains a rolling 10080 M1 bar buffer per symbol for deep structure context (BOS/CHOCH, OBs, FVGs). Old bars drop off automatically. Readiness tiers: <3 M5=Insufficient, 3-7=Basic, 8-19=Good, 20+=Strong.")
+    st.caption("The backend maintains a rolling 1440 M1 bar buffer (strict 1 day from the LIVE MARKET, not DB) per symbol. This enforces the 1-day limit for trend/structure checks after the system was off. No 8000+ candles. Readiness tiers: <3 M5=Insufficient, 3-7=Basic, 8-19=Good, 20+=Strong.")
 
 # =============================================================================
 # RUNNING TRADES (added at bottom as requested - keeps all previous UI intact)

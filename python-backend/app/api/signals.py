@@ -112,37 +112,36 @@ def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min
 
 @router.get("/debug/data-count")
 def get_data_count(symbol: str = None, timeframe: str = None):
-    """Debug endpoint to see how much data exists for a symbol/timeframe (pooled)"""
-    from app.db import db_cursor
+    """Debug endpoint to see how much LIVE market data (from EA / market, NOT DB) is in the rolling buffer.
+    Directly from the market via live buffers (1 day / 1440 M1 max now).
+    """
+    from app.live_data import get_buffer_status, get_all_buffer_lengths, list_tracked_symbols, get_recent_df
     try:
-        with db_cursor() as (c, cursor):
-            if symbol:
-                normalized = normalize_symbol(symbol)
-                if timeframe:
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM market_data WHERE symbol = %s AND timeframe = %s",
-                        (normalized, timeframe.upper())
-                    )
-                    count = cursor.fetchone()[0]
-                    return {
-                        "normalized_symbol": normalized,
-                        "timeframe": timeframe.upper(),
-                        "candle_count": count,
-                        "ready_for_default_structure": count >= 30,
-                        "ready_for_min_8 (what your EA uses)": count >= 8,
-                        "note": "Your EA currently requests with min_candles=8. Once candle_count >= 8, real structure signals can be generated (even if still weak)."
-                    }
-                else:
-                    cursor.execute(
-                        "SELECT timeframe, COUNT(*) FROM market_data WHERE symbol = %s GROUP BY timeframe",
-                        (normalized,)
-                    )
-                    rows = cursor.fetchall()
-                    return {"normalized_symbol": normalized, "by_timeframe": dict(rows)}
-            else:
-                cursor.execute("SELECT symbol, timeframe, COUNT(*) FROM market_data GROUP BY symbol, timeframe ORDER BY symbol, timeframe")
-                rows = cursor.fetchall()
-                return {"all_data": [{"symbol": r[0], "timeframe": r[1], "count": r[2]} for r in rows]}
+        if symbol:
+            normalized = normalize_symbol(symbol)
+            status = get_buffer_status(normalized)
+            count = status.get("bars_in_buffer", 0)
+            # For requested tf, we can note it's M1 based, or resample count but keep simple: report M1 live from market
+            return {
+                "normalized_symbol": normalized,
+                "timeframe": (timeframe or "M1").upper(),
+                "candle_count": count,
+                "ready_for_default_structure": count >= 30,
+                "ready_for_min_8 (what your EA uses)": count >= 8,
+                "note": "Data directly from live market buffer (EA payloads), not DB. Strictly limited to last 1 day (1440 M1 candles max). No more 8000+ candles.",
+                "buffer_status": status,
+                "source": "live_market_buffer"
+            }
+        else:
+            lengths = get_all_buffer_lengths()
+            tracked = list_tracked_symbols()
+            return {
+                "all_live_market_buffers": lengths,
+                "tracked": tracked,
+                "note": "Live M1 candle counts directly from the market (not DB). Capped at 1 day (1440).",
+                "max_per_day": 1440,
+                "source": "live_market_buffer"
+            }
     except Exception as e:
         return {"error": str(e)}
 
@@ -171,26 +170,16 @@ def get_trading_signal(
     min_required = min_candles if min_candles is not None else default_min
     min_required = max(min_required, 5)
 
+    # Get candles_available DIRECTLY FROM THE MARKET (live buffer), not DB.
+    # This is the rolling 1-day market data fed by EA.
+    from app.live_data import get_buffer_status
     candles_available = 0
-    from app.db import db_cursor
     try:
-        with db_cursor() as (c, cursor):
-            try:
-                c.rollback()
-            except:
-                pass
-            max_hours = float(get_settings().catchup_max_hours)
-            cursor.execute(
-                """
-                SELECT COUNT(*) FROM market_data
-                WHERE symbol = %s AND timeframe = %s
-                  AND timestamp >= NOW() - (%s * INTERVAL '1 hour')
-                """,
-                (normalized, tf_upper, max_hours),
-            )
-            candles_available = cursor.fetchone()[0] or 0
+        buf_status = get_buffer_status(normalized)
+        # Report M1 count from live market (buffer is always M1 from ticks/market)
+        candles_available = buf_status.get("bars_in_buffer", 0)
     except Exception as e:
-        print(f"[SIGNALS] count candles failed for {normalized}: {e}")
+        print(f"[SIGNALS] live buffer count failed for {normalized}: {e}")
         candles_available = 0
 
     if candles_available < min_required:

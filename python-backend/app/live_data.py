@@ -2,9 +2,11 @@
 Live Data Buffer for real-time TICK to M1 aggregation (simpler updating logic).
 
 Supports the real-time POST /market-data path.
-Buffer size 10080 M1 bars.
+Buffer size now strictly 1440 M1 bars (1 day) — per requirement to limit trend/structure checks and displays after system off / restart.
+No more 8000+ candle buffers; 1 trading day has 1440 M1 candles (24h * 60).
 The last entry in the buffer for a symbol is always the current forming minute and gets updated live on every call within the minute.
 This makes the buffer (and debug/UI) show data immediately and the numbers update on every incoming payload.
+Data comes directly from the market (via EA TICK/M1 payloads), not DB.
 """
 
 from collections import deque
@@ -21,9 +23,10 @@ LIVE_BARS: Dict[str, Deque[dict]] = {}
 # Real per-symbol tick counters (for debug visibility)
 TICK_STATS: Dict[str, int] = {}
 
-# 10080 M1 bars (~1 week: 7 * 24 * 60)
-MAX_COMPLETED_BARS = 10080
-# 2016 M5 bars (~1 week: 7 * 24 * 12) — derived from M1, tracked for UI/engine
+# 1440 M1 bars (strict 1 day: 24 * 60) — limit for post-off trend/structure checks and all displays.
+# (Previously 10080 for a week; user requested no more than 1 day, and 8k+ is way more than 1440 in 1 day.)
+MAX_COMPLETED_BARS = 24 * 60
+# 288 M5 bars (1 day: 24 * 12) — derived from M1
 MAX_M5_BARS = MAX_COMPLETED_BARS // 5
 
 
@@ -330,7 +333,7 @@ def get_recent_df_for_structure(symbol: str, limit: Optional[int] = None) -> Opt
 
 
 def get_buffer_status(symbol: str) -> Dict[str, Any]:
-    """Debug / UI helper — includes both M1 and derived M5 buffer fill."""
+    """Debug / UI helper — includes both M1 and derived M5 buffer fill. Now strictly 1 day (1440 M1) direct from live market data, not DB. Displays will no longer show 8000+ candles."""
     symbol = _resolve_buffer_key(symbol)
     buf = LIVE_BARS.get(symbol, deque())
     count = len(buf)
