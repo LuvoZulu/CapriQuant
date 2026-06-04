@@ -119,6 +119,9 @@ def normalize_symbol(symbol: str) -> str:
 def market_data(data: dict, background_tasks: BackgroundTasks):
     symbol = normalize_symbol(data.get("symbol", "UNKNOWN"))
     timeframe = data.get("timeframe", "M5").upper()
+    if timeframe == "TICK":
+        timeframe = "M1"
+    is_backfill = data.get("backfill") in (True, "true", 1, "1", "True")
     req_id = str(uuid.uuid4())[:8]
 
     # === Data Quality Gate (phase2) - reject poison early ===
@@ -148,7 +151,7 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
                 now = _dt.utcnow()
                 if (ts_dt - now).total_seconds() > 300:
                     bad_reasons.append("future_timestamp")
-                if (now - ts_dt).total_seconds() > 86400 * 3:
+                if (now - ts_dt).total_seconds() > 86400 * 1:
                     bad_reasons.append("ancient_timestamp")
             except:
                 pass
@@ -170,7 +173,51 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
     # Log live data (with correlation id)
     logger.info(f"[LIVE DATA {req_id}] {symbol} {timeframe} | Close={data.get('close')} | Bid={data.get('bid')} | Ask={data.get('ask')} | Volume={data.get('volume')}")
 
-    # 1. Update live buffer immediately (this is the fresh data we will use for decisions)
+    # Historical catch-up: never older than 24h — buffer + DB only, no signals/trades
+    if is_backfill:
+        from app.live_data import is_within_catchup_window, to_naive_utc
+        ts_raw = data.get("timestamp")
+        if ts_raw is not None and not is_within_catchup_window(to_naive_utc(ts_raw)):
+            logger.info(f"[BACKFILL] skipped stale bar for {symbol}: {ts_raw}")
+            return {
+                "status": "backfill_skipped_stale",
+                "normalized_symbol": symbol,
+                "timeframe": timeframe,
+                "max_lookback_hours": get_settings().catchup_max_hours,
+            }
+        live_buffer.add_market_data(symbol, data)
+
+        def _persist_backfill():
+            from app.db import db_cursor
+            try:
+                with db_cursor() as (c, cur):
+                    ts_val = data.get("timestamp")
+                    if ts_val:
+                        cur.execute(
+                            """
+                            INSERT INTO market_data
+                            (symbol, timeframe, timestamp, open, high, low, close, tick_volume, spread)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                symbol, timeframe, ts_val,
+                                data.get("open"), data.get("high"), data.get("low"),
+                                data.get("close"), data.get("volume"), data.get("spread", 0),
+                            ),
+                        )
+                    c.commit()
+            except Exception as e:
+                logger.error(f"Background backfill DB insert failed for {symbol}: {e}")
+
+        background_tasks.add_task(_persist_backfill)
+        return {
+            "status": "backfill_stored",
+            "normalized_symbol": symbol,
+            "timeframe": timeframe,
+            "max_lookback_hours": get_settings().catchup_max_hours,
+        }
+
+    # 1. Update live buffer for live ticks only (backfill handled above)
     live_buffer.add_market_data(symbol, data)
 
     # 2. Try to compute real-time signal using recent live data (more aggressive for live path)
@@ -226,11 +273,10 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
                     signal_result["rationale"] = f"Risk veto: {veto_reason} (streak={streak}). {old_rat}".strip()
                     logger.warning(f"[RISK VETO REALTIME] {symbol} {orig} -> HOLD : {veto_reason}")
                 else:
-                    # prefer server stop from structure if present
-                    for cand in ("validated_stop", "stop_suggestion", "stop"):
-                        if cand in signal_result and signal_result.get(cand):
-                            signal_result["validated_stop"] = signal_result[cand]
-                            break
+                    from app.api.signals import _resolve_validated_stop
+                    vstop = _resolve_validated_stop(signal_result)
+                    if vstop:
+                        signal_result["validated_stop"] = vstop
     except Exception as e:
         logger.error(f"[RISK] realtime veto layer error (non-fatal): {e}")
 
@@ -254,27 +300,37 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
         # Apply kill switch / system mode override (non-bypassable)
         signal_result = _apply_system_mode_to_signal(signal_result, symbol)
         response["signal"] = signal_result
+        _flatten_signal_for_ea(response, signal_result)
         # Pretty print the real-time signal we just computed from live data
         print(f"\n[REALTIME SIGNAL from POST] {symbol} {timeframe}", json.dumps(signal_result, indent=2, default=str))
         # Promote key risk fields to top-level response for EA convenience (in addition to inside signal)
         for k in ("risk_pct", "risk_streak", "risk_veto", "validated_stop", "system_mode", "action"):
             if k in signal_result:
                 response[k] = signal_result[k]
+        try:
+            from app.utils.signal_logger import log_signal
+            log_signal(signal_result, symbol=symbol, timeframe=timeframe)
+        except Exception:
+            pass
 
         # Post-entry management suggestions for any current opens on this symbol (best for the system)
         try:
             from app.db import db_cursor
+            from app.utils.symbols import symbol_sql_match
+            sym_clause, sym_params = symbol_sql_match(symbol)
             with db_cursor() as (c, cur):
-                cur.execute("""
+                cur.execute(f"""
                     SELECT ts, symbol, direction, entry_price, stop_loss, tp1, tp2, volume_lots, notes, ticket, outcome
                     FROM executed_trades
-                    WHERE symbol = %s AND (outcome = 'open' OR outcome IS NULL OR outcome = '')
+                    WHERE {sym_clause} AND (outcome = 'open' OR outcome IS NULL OR outcome = '')
                     ORDER BY ts DESC LIMIT 5
-                """, (symbol,))
+                """, sym_params)
                 opens = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
             if opens:
                 from app.features.builder import compute_structure
+                from app.live_data import filter_df_to_catchup_window
                 df_m5 = live_buffer.get_recent_m5_df(symbol, limit=200)
+                df_m5 = filter_df_to_catchup_window(df_m5)
                 if df_m5 is not None and len(df_m5) >= 5:
                     ms = compute_structure(df_m5, symbol=symbol, timeframe="M5", min_candles=5)
                     mgmts = compute_managements_for_all_opens(opens, {symbol: ms}, get_system_mode())
@@ -427,7 +483,9 @@ def api_open_trades(symbol: str = None, limit: int = 50):
                 s = t.get("symbol")
                 if s and s not in live_mss:
                     try:
+                        from app.live_data import filter_df_to_catchup_window
                         df = live_buffer.get_recent_m5_df(s, limit=200)
+                        df = filter_df_to_catchup_window(df)
                         if df is not None and len(df) >= 5:
                             ms = compute_structure(df, symbol=s, timeframe="M5", min_candles=5)
                             live_mss[s] = ms
@@ -479,6 +537,8 @@ def api_system_status():
         "mode": get_system_mode(),
         "buffer_max_m1": getattr(live_buffer, 'max_bars', 10080),
         "buffer_max_m5": getattr(live_buffer, 'max_m5_bars', 2016),
+        "catchup_max_hours": get_settings().catchup_max_hours,
+        "catchup_max_m1_bars": get_settings().catchup_max_m1_bars,
         "symbols_tracked": syms,
         "buffers": buffers,
         "recent_data_quality_issues": {s: _QUALITY_BAD.get(s, []) for s in syms},
@@ -521,6 +581,8 @@ def api_current_structure(symbol: str):
     try:
         from app.features.builder import compute_structure
         from app.features.structure import generate_structure_summary
+        from app.live_data import filter_df_to_catchup_window
+        df_m5 = filter_df_to_catchup_window(df_m5)
         ms = compute_structure(df_m5, symbol=sym, timeframe="M5", min_candles=3)
         summary = generate_structure_summary(ms)
         return {
@@ -682,6 +744,28 @@ def api_control(payload: dict):
         return {"status": "ok", "mode": new_mode}
     else:
         return {"status": "error", "message": "Unknown action. Use flatten_all, pause, resume, or set_mode + mode."}
+
+def _flatten_signal_for_ea(response: dict, signal_result: dict) -> None:
+    """
+    MT5 EA parses flat sig_* keys from POST /market-data responses.
+    The nested 'signal' object alone is not readable by the simple MQL5 JSON helpers.
+    """
+    if not isinstance(signal_result, dict):
+        return
+    response["sig_dir"] = signal_result.get("signal")
+    response["sig_confidence"] = signal_result.get("confidence")
+    response["sig_setup"] = signal_result.get("setup")
+    response["sig_rationale"] = signal_result.get("rationale")
+    stop = signal_result.get("validated_stop") or signal_result.get("stop_suggestion")
+    response["sig_stop_suggestion"] = stop
+    response["sig_tp1"] = signal_result.get("tp1")
+    response["sig_tp2"] = signal_result.get("tp2")
+    mgmt = signal_result.get("management")
+    if isinstance(mgmt, dict):
+        response["management_action"] = mgmt.get("action")
+        response["management_new_sl"] = mgmt.get("new_sl")
+        response["management_reason"] = mgmt.get("reason")
+
 
 def _apply_system_mode_to_signal(signal_dict: dict, symbol: str = "") -> dict:
     """If system not in trading mode, override signal to HOLD or special FLATTEN."""
