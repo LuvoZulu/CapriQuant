@@ -173,11 +173,20 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
     # Log live data (with correlation id)
     logger.info(f"[LIVE DATA {req_id}] {symbol} {timeframe} | Close={data.get('close')} | Bid={data.get('bid')} | Ask={data.get('ask')} | Volume={data.get('volume')}")
 
-    # 1. Update live buffer immediately (this is the fresh data we will use for decisions)
-    live_buffer.add_market_data(symbol, data)
-
-    # Historical catch-up: buffer + DB only — do not fire live trades on stale bars
+    # Historical catch-up: never older than 24h — buffer + DB only, no signals/trades
     if is_backfill:
+        from app.live_data import is_within_catchup_window, to_naive_utc
+        ts_raw = data.get("timestamp")
+        if ts_raw is not None and not is_within_catchup_window(to_naive_utc(ts_raw)):
+            logger.info(f"[BACKFILL] skipped stale bar for {symbol}: {ts_raw}")
+            return {
+                "status": "backfill_skipped_stale",
+                "normalized_symbol": symbol,
+                "timeframe": timeframe,
+                "max_lookback_hours": get_settings().catchup_max_hours,
+            }
+        live_buffer.add_market_data(symbol, data)
+
         def _persist_backfill():
             from app.db import db_cursor
             try:
@@ -205,7 +214,11 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
             "status": "backfill_stored",
             "normalized_symbol": symbol,
             "timeframe": timeframe,
+            "max_lookback_hours": get_settings().catchup_max_hours,
         }
+
+    # 1. Update live buffer for live ticks only (backfill handled above)
+    live_buffer.add_market_data(symbol, data)
 
     # 2. Try to compute real-time signal using recent live data (more aggressive for live path)
     # Prefer full MTF production path when buffers allow (best for system)
@@ -520,6 +533,8 @@ def api_system_status():
         "mode": get_system_mode(),
         "buffer_max_m1": getattr(live_buffer, 'max_bars', 10080),
         "buffer_max_m5": getattr(live_buffer, 'max_m5_bars', 2016),
+        "catchup_max_hours": get_settings().catchup_max_hours,
+        "catchup_max_m1_bars": get_settings().catchup_max_m1_bars,
         "symbols_tracked": syms,
         "buffers": buffers,
         "recent_data_quality_issues": {s: _QUALITY_BAD.get(s, []) for s in syms},

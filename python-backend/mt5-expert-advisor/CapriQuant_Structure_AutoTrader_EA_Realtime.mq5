@@ -87,6 +87,14 @@ datetime LoadLastSyncTime()
 }
 
 //+------------------------------------------------------------------+
+//| Earliest bar time allowed for catch-up (never older than 1 day)  |
+//+------------------------------------------------------------------+
+datetime GetMaxBackfillStart(datetime now)
+{
+   return now - BACKFILL_MAX_SECONDS;
+}
+
+//+------------------------------------------------------------------+
 //| OnInit                                                           |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -99,6 +107,13 @@ int OnInit()
 
    // Load last sent bar time (persisted across EA restarts / terminal restarts)
    g_lastBackfillTime = LoadLastSyncTime();
+   datetime earliest = GetMaxBackfillStart(TimeCurrent());
+   if(g_lastBackfillTime > 0 && g_lastBackfillTime < earliest)
+   {
+      Print("[CapriQuant BACKFILL] last_sync older than 1 day — clamping to ", TimeToString(earliest));
+      g_lastBackfillTime = earliest;
+      SaveLastSyncTime(g_lastBackfillTime);
+   }
    g_backfillDone = false;
 
    Print("================================================================");
@@ -263,14 +278,6 @@ void SendHistoricalBar(const MqlRates &r)
 }
 
 //+------------------------------------------------------------------+
-//| Earliest bar time allowed for catch-up (never older than 1 day)  |
-//+------------------------------------------------------------------+
-datetime GetMaxBackfillStart(datetime now)
-{
-   return now - BACKFILL_MAX_SECONDS;
-}
-
-//+------------------------------------------------------------------+
 //| Catch-up backfill: fill only the gap since last sync, capped at  |
 //| 1 calendar day. If the system was off longer, trend/structure uses |
 //| at most the last 24h — avoids huge historical rollbacks.         |
@@ -320,6 +327,8 @@ void DoBackfillIfNeeded()
    int sent = 0;
    for(int i = 0; i < copied; i++)
    {
+      if(rates[i].time < earliest_allowed)
+         continue;
       SendHistoricalBar(rates[i]);
       g_lastBackfillTime = rates[i].time;
       sent++;

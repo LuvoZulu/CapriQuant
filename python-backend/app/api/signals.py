@@ -55,10 +55,12 @@ def normalize_symbol(symbol: str) -> str:
 def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min_candles_override: int = None) -> pd.DataFrame:
     normalized_symbol = normalize_symbol(symbol)
 
+    max_hours = float(get_settings().catchup_max_hours)
     query = """
         SELECT timestamp, open, high, low, close, tick_volume as volume
         FROM market_data
         WHERE symbol = %s AND timeframe = %s
+          AND timestamp >= NOW() - (%s * INTERVAL '1 hour')
         ORDER BY timestamp DESC
         LIMIT %s
     """
@@ -66,12 +68,12 @@ def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min
     from app.db import db_cursor
     try:
         with db_cursor() as (c, cur):
-            cur.execute(query, (normalized_symbol, timeframe, CANDLE_LIMIT))
+            cur.execute(query, (normalized_symbol, timeframe, max_hours, CANDLE_LIMIT))
             rows = cur.fetchall()
     except Exception:
         # legacy fallback
         cursor = conn.cursor()
-        cursor.execute(query, (normalized_symbol, timeframe, CANDLE_LIMIT))
+        cursor.execute(query, (normalized_symbol, timeframe, max_hours, CANDLE_LIMIT))
         rows = cursor.fetchall()
         cursor.close()
 
@@ -167,9 +169,14 @@ def get_trading_signal(
                 c.rollback()
             except:
                 pass
+            max_hours = float(get_settings().catchup_max_hours)
             cursor.execute(
-                "SELECT COUNT(*) FROM market_data WHERE symbol = %s AND timeframe = %s",
-                (normalized, tf_upper)
+                """
+                SELECT COUNT(*) FROM market_data
+                WHERE symbol = %s AND timeframe = %s
+                  AND timestamp >= NOW() - (%s * INTERVAL '1 hour')
+                """,
+                (normalized, tf_upper, max_hours),
             )
             candles_available = cursor.fetchone()[0] or 0
     except Exception as e:

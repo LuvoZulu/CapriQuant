@@ -47,6 +47,10 @@ class Settings:
     # Data quality
     max_spread_for_trade: float = 400.0  # points
 
+    # Catch-up / rollback after downtime: never use bars older than this for live trend/signals
+    catchup_max_hours: float = 24.0
+    catchup_max_m1_bars: int = 24 * 60  # 1440 — hard cap aligned with 1 day of M1
+
     # System
     backend_port: int = 8001
     poll_seconds: int = 2
@@ -61,6 +65,8 @@ class Settings:
             self.symbols = [s.strip().upper() for s in syms.split(",") if s.strip()]
         self.default_spread_points = float(os.getenv("CAPRI_SPREAD_POINTS", self.default_spread_points))
         self.management_enabled = os.getenv("CAPRI_MANAGEMENT_ENABLED", "true").lower() == "true"
+        self.catchup_max_hours = float(os.getenv("CAPRI_CATCHUP_MAX_HOURS", self.catchup_max_hours))
+        self.catchup_max_m1_bars = int(os.getenv("CAPRI_CATCHUP_MAX_M1_BARS", self.catchup_max_m1_bars))
 
 # Global instance
 settings = Settings()

@@ -169,6 +169,8 @@ void DoBackfillIfNeeded()
    int sent = 0;
    for(int i = 0; i < copied; i++)
    {
+      if(rates[i].time < earliest_allowed)
+         continue;
       SendHistoricalBar(rates[i]);
       g_lastBackfillTime = rates[i].time;
       sent++;
@@ -198,6 +200,13 @@ int OnInit()
 
    // Load last sent bar time (persisted across EA restarts / terminal restarts)
    g_lastBackfillTime = LoadLastSyncTime();
+   datetime earliest = GetMaxBackfillStart(TimeCurrent());
+   if(g_lastBackfillTime > 0 && g_lastBackfillTime < earliest)
+   {
+      Print("[CapriQuant BACKFILL] last_sync older than 1 day — clamping to ", TimeToString(earliest));
+      g_lastBackfillTime = earliest;
+      SaveLastSyncTime(g_lastBackfillTime);
+   }
    g_backfillDone = false;
 
    Print("================================================================");
