@@ -270,6 +270,70 @@ See GAP_ANALYSIS.md and NEXT_RECOMMENDATIONS.md for full history and future plan
 
 ---
 
+## Monitoring Metrics
+
+To monitor the health, buffers, risk state, alerts, and overall system state, poll these backend endpoints (default base URL: `http://127.0.0.1:8001`).
+
+### Primary Endpoint for Metrics
+- `GET /metrics`  
+  Returns **Prometheus-compatible text metrics**. Best for Grafana, Prometheus, or custom scrapers.  
+  Current metrics include:
+  - `capri_system_mode{mode="trading|paused|flatten"} 1`
+  - `capri_buffer_bars{symbol="XAUUSD"} N`
+  - `capri_buffer_m5_bars{symbol="XAUUSD"} N`
+  - `capri_data_quality_bad_count{symbol="XAUUSD"} N`
+  - `capri_up 1`
+
+### Recommended Endpoints for Full Monitoring
+Poll these regularly (every 5–30 seconds recommended):
+
+| Endpoint                        | Purpose                                              | Format |
+|---------------------------------|------------------------------------------------------|--------|
+| `/api/system-status`            | Full status (mode, buffers, quality issues, **alerts**) | JSON |
+| `/api/alerts`                   | Current active alerts (kill switch, streak, daily loss, data quality) | JSON |
+| `/api/health`                   | Quick health check + mode + buffer OK flag          | JSON |
+| `/debug/live-buffer`            | Buffer status for all tracked symbols               | JSON |
+| `/debug/live-buffer/{symbol}`   | Detailed buffer info for one symbol                 | JSON |
+| `/api/system-mode`              | Current kill/pause/flatten mode                     | JSON |
+| `/api/open-trades`              | Live open positions + management suggestions (BE/trail/close) | JSON |
+
+### Additional Useful Endpoints
+- `/api/recent-signals` — Recent signals (with confluence, setup, rationale)
+- `/api/trades` — Historical executed trades (r_multiple, close_reason, setup)
+- `/signal/{symbol}/{timeframe}?engine=structure` — On-demand current signal
+
+**Simple Python monitoring loop example**:
+
+```python
+import requests
+import time
+
+BASE = "http://127.0.0.1:8001"
+
+while True:
+    try:
+        metrics_text = requests.get(f"{BASE}/metrics", timeout=3).text
+        status = requests.get(f"{BASE}/api/system-status", timeout=3).json()
+        alerts = requests.get(f"{BASE}/api/alerts", timeout=3).json()
+
+        print("=== Metrics (first 300 chars) ===")
+        print(metrics_text[:300])
+        print("Alerts:", alerts.get("alerts", []))
+        # Add your own logic here: log, email, Slack webhook, etc.
+    except Exception as e:
+        print("Monitor error:", e)
+    time.sleep(15)
+```
+
+The Streamlit dashboard (`python-backend/ui/dashboard.py`) already polls several of these endpoints (`/api/system-status`, `/debug/live-buffer`, `/api/alerts`, `/api/open-trades`).
+
+For production monitoring:
+- Scrape `/metrics` with Prometheus/Grafana.
+- Use the JSON endpoints for custom dashboards or alerting scripts.
+- Consider exposing them only on localhost or via a reverse proxy for security.
+
+---
+
 ## Quick Directory Reference
 
 - Backend code: `python-backend\`

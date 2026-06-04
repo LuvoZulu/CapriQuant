@@ -54,6 +54,125 @@ ulong    lastDataSendTime = 0;   // For throttling data sends
 ulong    g_knownOpenTickets[];
 ulong    g_reportedClosedTickets[];
 
+// Backfill / catch-up after downtime (PC off, restart, missed Asian etc.)
+// We persist the last successfully sent M1 bar time to a file so on next EA start
+// we can detect the gap and ask MT5 for the missing candles, send them as backfill
+// so the Python backend can fill its buffers + DB. This makes structure/AMD "see"
+// what happened while the system was off, without blind spots.
+datetime g_lastBackfillTime = 0;
+bool     g_backfillDone     = false;
+
+//+------------------------------------------------------------------+
+//| Persist last synced M1 bar time (for catch-up backfill on restart) |
+//+------------------------------------------------------------------+
+void SaveLastSyncTime(datetime t)
+{
+   // Use FILE_COMMON so it survives terminal restarts / different terminals on same PC
+   int h = FileOpen("capriquant_sync_" + _Symbol + ".dat", FILE_WRITE | FILE_BIN | FILE_COMMON);
+   if(h != INVALID_HANDLE)
+   {
+      FileWriteLong(h, (long)t);
+      FileClose(h);
+   }
+}
+
+datetime LoadLastSyncTime()
+{
+   int h = FileOpen("capriquant_sync_" + _Symbol + ".dat", FILE_READ | FILE_BIN | FILE_COMMON);
+   datetime t = 0;
+   if(h != INVALID_HANDLE)
+   {
+      t = (datetime)FileReadLong(h);
+      FileClose(h);
+   }
+   return t;
+}
+
+//+------------------------------------------------------------------+
+//| Send one historical M1 bar as backfill (called during catch-up)  |
+//| Includes "backfill":true so backend knows to merge into history  |
+//| without treating as fresh realtime tick for decisions.           |
+//+------------------------------------------------------------------+
+void SendHistoricalBar(const MqlRates &r)
+{
+   string ts_str = TimeToString(r.time, TIME_DATE|TIME_SECONDS);
+
+   // Historical payload - no need for live bid/ask/equity. Backend stores by timestamp.
+   string payload = StringFormat(
+      "{\"symbol\":\"%s\",\"timeframe\":\"M1\",\"bid\":%.5f,\"ask\":%.5f,\"last\":%.5f,"
+      "\"open\":%.5f,\"high\":%.5f,\"low\":%.5f,\"close\":%.5f,\"volume\":%d,"
+      "\"balance\":0.0,\"equity\":0.0,\"timestamp\":\"%s\",\"backfill\":true}",
+      currentSymbol, r.close, r.close, r.close,
+      r.open, r.high, r.low, r.close, (int)r.tick_volume,
+      ts_str);
+
+   string headers = "Content-Type: application/json\r\n";
+   uchar post_data[];
+   StringToCharArray(payload, post_data, 0, StringLen(payload));
+   uchar result_data[];
+   string response_headers;
+
+   WebRequest("POST", ServerURL + "/market-data", headers, httpTimeout, post_data, result_data, response_headers);
+}
+
+//+------------------------------------------------------------------+
+//| Catch-up backfill: when EA (re)starts after being off, fetch the |
+//| M1 bars that were missed and send them so backend buffers + DB   |
+//| contain continuous history. This lets structure/AMD "see" what   |
+//| formed during the gap (e.g. full Asian session) and makes the    |
+//| current state accurate instead of cold-start blind spot.         |
+//+------------------------------------------------------------------+
+void DoBackfillIfNeeded()
+{
+   if(g_backfillDone) return;
+
+   datetime now = TimeCurrent();
+   if(g_lastBackfillTime == 0)
+   {
+      // First run ever for this symbol - seed a reasonable window (e.g. last ~8-12h)
+      g_lastBackfillTime = now - (PeriodSeconds(PERIOD_M1) * 600);
+   }
+
+   int m1_sec = PeriodSeconds(PERIOD_M1);
+   datetime from = g_lastBackfillTime + m1_sec;
+   if(from >= now)
+   {
+      g_backfillDone = true;
+      SaveLastSyncTime(g_lastBackfillTime);
+      return;
+   }
+
+   // How many bars to request this chunk (cap to avoid huge single WebRequest storms)
+   int needed = (int)((now - from) / m1_sec) + 5;
+   int chunk  = MathMin(needed, 400);   // ~6-7 hours per timer call max; will continue if more
+
+   MqlRates rates[];
+   int copied = CopyRates(currentSymbol, PERIOD_M1, from, chunk, rates);
+   if(copied <= 0)
+      return; // will retry next timer
+
+   Print("[CapriQuant BACKFILL] Sending ", copied, " historical M1 bars for gap starting ", TimeToString(from));
+
+   int sent = 0;
+   for(int i = 0; i < copied; i++)
+   {
+      SendHistoricalBar(rates[i]);
+      g_lastBackfillTime = rates[i].time;
+      sent++;
+      if(sent % 30 == 0) Sleep(80); // be nice to the server and ourselves
+   }
+
+   SaveLastSyncTime(g_lastBackfillTime);
+
+   // Are we caught up?
+   if((g_lastBackfillTime + m1_sec) >= (now - 60))
+      g_backfillDone = true;
+   else
+      Print("[CapriQuant BACKFILL] Partial catch-up for ", currentSymbol, " - will continue on next timer.");
+
+   // After backfill chunk, the live OnTick data will resume with full context in backend.
+}
+
 //+------------------------------------------------------------------+
 //| OnInit                                                           |
 //+------------------------------------------------------------------+
@@ -65,12 +184,17 @@ int OnInit()
    ArrayResize(g_knownOpenTickets, 0);
    ArrayResize(g_reportedClosedTickets, 0);
 
+   // Load last sent bar time (persisted across EA restarts / terminal restarts)
+   g_lastBackfillTime = LoadLastSyncTime();
+   g_backfillDone = false;
+
    Print("================================================================");
-   Print("=== CapriQuant REAL-TIME AUTO-TRADER v5.3-fixed             ===");
+   Print("=== CapriQuant REAL-TIME AUTO-TRADER v5.4-backfill            ===");
    Print("Symbol: ", currentSymbol);
    Print("Data sent on every tick (throttled to ~", DataSendIntervalMs, "ms)");
    Print("Signals polled every ", SignalPollSeconds, " seconds");
    Print("Close reporting enabled for SL/TP dashboard tracking");
+   Print("Backfill/catch-up on start: last_sync=", (g_lastBackfillTime>0 ? TimeToString(g_lastBackfillTime) : "never"));
    Print("================================================================");
 
    return INIT_SUCCEEDED;
@@ -82,6 +206,8 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   if(g_lastBackfillTime > 0)
+      SaveLastSyncTime(g_lastBackfillTime);
 }
 
 //+------------------------------------------------------------------+
@@ -107,6 +233,17 @@ void OnTick()
 void OnTimer()
 {
    if(!EnableTrading) return;
+
+   // === BACKFILL / CATCH-UP (new) ===
+   // If we have a gap since last sync (EA or PC was off), collect the missing
+   // M1 bars from the broker history and ship them to the backend as backfill.
+   // This populates DB + live buffers so structure engine has continuous context
+   // (critical for AMD session ranges, BOS/CHOCH that happened while "off").
+   if(!g_backfillDone)
+   {
+      DoBackfillIfNeeded();
+      // continue to normal signal poll after (or during) backfill chunks
+   }
 
    // Daily reset logic
    MqlDateTime nowStruct, lastStruct;
@@ -180,6 +317,8 @@ void SendMarketDataRealtime()
 
    WebRequest("POST", ServerURL + "/market-data", headers, httpTimeout, post_data, result_data, response_headers);
 }
+
+// (backfill helpers are defined earlier, right after globals, to avoid MQL5 forward reference issues)
 
 //+------------------------------------------------------------------+
 //| Request signal (same as before)                                  |
