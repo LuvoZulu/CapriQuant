@@ -21,7 +21,6 @@ from app.features.structure import MarketStructure, OrderBlock
 # Import the fully rewritten contextual analyzers
 from app.strategies import amd, fibonacci, price_action, liquidity, crt
 from app.config import get_settings
-from app.utils.signal_logger import log_signal
 
 
 def generate_structure_summary(ms: MarketStructure) -> str:
@@ -522,11 +521,5 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
             {"name": s.name, "direction": s.direction, "score": round(s.score, 2)} for s in setups
         ],
     }
-
-    # Log every signal for future analysis
-    try:
-        log_signal(result)
-    except Exception:
-        pass
 
     return result

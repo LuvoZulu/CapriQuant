@@ -444,6 +444,12 @@ void ProcessSignalResponse(string json)
 
    if(confidence < MinConfidence) return;
 
+   if(stop <= 0.0)
+   {
+      Print("[CapriQuant] Reject trade: missing valid stop from server (setup=", setup, ")");
+      return;
+   }
+
    double spread = (SymbolInfoDouble(currentSymbol, SYMBOL_ASK) - SymbolInfoDouble(currentSymbol, SYMBOL_BID)) / _Point;
    if(spread > MaxSpreadPoints) return;
 
@@ -453,7 +459,7 @@ void ProcessSignalResponse(string json)
    double effRisk = RiskPercent;
    if(server_risk_pct > 0.1) effRisk = server_risk_pct;
 
-   double lots = CalculateLots(stop, effRisk);
+   double lots = CalculateLots(stop, effRisk, signalDir);
    if(lots <= 0) return;
 
    ulong ticket = ExecuteTrade(signalDir, lots, stop, tp1, tp2, setup);
@@ -588,14 +594,19 @@ void CloseAllPositions(string reason = "kill_switch")
    }
 }
 
-// CalculateLots now accepts optional riskPct so we can use server value without touching the input
-double CalculateLots(double stopPrice, double riskPct = -1.0)
+// CalculateLots: direction-aware entry price + valid stop required
+double CalculateLots(double stopPrice, double riskPct = -1.0, string direction = "BUY")
 {
    if(riskPct <= 0.0) riskPct = RiskPercent;
 
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskMoney = equity * (riskPct / 100.0);
-   double entry = SymbolInfoDouble(currentSymbol, SYMBOL_ASK);
+   double entry = (direction == "BUY")
+      ? SymbolInfoDouble(currentSymbol, SYMBOL_ASK)
+      : SymbolInfoDouble(currentSymbol, SYMBOL_BID);
+
+   if(stopPrice <= 0.0)
+      return 0.0;
 
    double stopDist = MathAbs(entry - stopPrice);
    if(stopDist < 0.00001) stopDist = SymbolInfoDouble(currentSymbol, SYMBOL_POINT) * 80;
@@ -630,7 +641,9 @@ ulong ExecuteTrade(string direction, double lots, double sl, double tp1, double 
       Print("[CapriQuant] OrderSend FAILED: ", res.retcode, " - ", res.comment);
       return 0;
    }
-   ulong ticket = res.order;
+   // Position id matches DEAL_POSITION_ID used when reporting closes
+   ulong ticket = res.position;
+   if(ticket == 0) ticket = res.order;
    if(ticket == 0) ticket = res.deal;
    return ticket;
 }

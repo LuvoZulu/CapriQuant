@@ -77,19 +77,16 @@ except Exception as _e:
 
 # --- Appended by fix script: pooling notes + trade close schema + upsert logic ---
 
+_live_tables_ready = False
+
+
 def ensure_live_tables():
-    """Idempotent tables, indexes, and close tracking columns."""
-    if cursor is None:
+    """Idempotent tables, indexes, and close tracking columns (pooled)."""
+    global _live_tables_ready
+    if _live_tables_ready:
         return
-    try:
-        try:
-            conn.rollback()
-        except:
-            pass
-    except:
-        pass
-    try:
-        cursor.execute("""
+    ddl = [
+        """
         CREATE TABLE IF NOT EXISTS live_signals (
             id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT NOW(), symbol TEXT NOT NULL,
             timeframe TEXT NOT NULL, signal TEXT, score DOUBLE PRECISION, confidence DOUBLE PRECISION,
@@ -97,10 +94,9 @@ def ensure_live_tables():
             current_price DOUBLE PRECISION, market_structure JSONB, confluences JSONB,
             buffer_bars INTEGER, raw_response JSONB, created_at TIMESTAMPTZ DEFAULT NOW()
         );
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_live_signals_sym_ts ON live_signals (symbol, ts DESC);")
-
-        cursor.execute("""
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_live_signals_sym_ts ON live_signals (symbol, ts DESC);",
+        """
         CREATE TABLE IF NOT EXISTS executed_trades (
             id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT NOW(), symbol TEXT NOT NULL,
             direction TEXT, entry_price DOUBLE PRECISION, stop_loss DOUBLE PRECISION,
@@ -109,81 +105,146 @@ def ensure_live_tables():
             created_at TIMESTAMPTZ DEFAULT NOW(),
             ticket BIGINT, close_price DOUBLE PRECISION, close_ts TIMESTAMPTZ, close_reason TEXT
         );
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec_trades_sym_ts ON executed_trades (symbol, ts DESC);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec_trades_ticket ON executed_trades (ticket);")
-
-        for col in ["ticket BIGINT", "close_price DOUBLE PRECISION", "close_ts TIMESTAMPTZ", "close_reason TEXT", "entry_context JSONB", "setup TEXT"]:
-            try:
-                cursor.execute("ALTER TABLE executed_trades ADD COLUMN IF NOT EXISTS " + col + ";")
-            except: pass
-
-        cursor.execute("""
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_exec_trades_sym_ts ON executed_trades (symbol, ts DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_exec_trades_ticket ON executed_trades (ticket);",
+        """
         CREATE TABLE IF NOT EXISTS structure_events (
             id BIGSERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT NOW(), symbol TEXT NOT NULL,
             event_type TEXT, direction TEXT, price DOUBLE PRECISION, details JSONB, created_at TIMESTAMPTZ DEFAULT NOW()
         );
-        """)
-        conn.commit()
-    except Exception:
-        try: conn.rollback()
-        except: pass
+        """,
+    ]
+    extra_cols = [
+        "ticket BIGINT", "close_price DOUBLE PRECISION", "close_ts TIMESTAMPTZ",
+        "close_reason TEXT", "entry_context JSONB", "setup TEXT",
+    ]
+    try:
+        with db_cursor() as (c, cur):
+            for stmt in ddl:
+                cur.execute(stmt)
+            for col in extra_cols:
+                try:
+                    cur.execute("ALTER TABLE executed_trades ADD COLUMN IF NOT EXISTS " + col + ";")
+                except Exception:
+                    pass
+            c.commit()
+        _live_tables_ready = True
+    except Exception as e:
+        print(f"[DB] ensure_live_tables failed: {e}")
+
 
 def persist_trade(trade: dict):
-    """Support close updates by ticket or insert."""
+    """Support close updates by ticket or insert (pooled — works when legacy conn is down)."""
+    from app.utils.symbols import normalize_symbol
+
     ensure_live_tables()
-    if cursor is None:
+    sym = normalize_symbol(trade.get("symbol") or "")
+    if not sym:
         return
+
+    status = (trade.get("status") or trade.get("outcome") or "open").lower()
+    outcome = trade.get("outcome") or ("closed" if status == "closed" else "open")
+    ticket = trade.get("ticket")
+    if ticket is not None:
+        try:
+            ticket = int(ticket)
+        except (TypeError, ValueError):
+            ticket = None
+
     try:
-        ticket = trade.get("ticket")
-        if ticket:
-            cursor.execute("""
-                UPDATE executed_trades SET
-                    close_price = COALESCE(%s, close_price),
-                    close_ts = COALESCE(%s, close_ts),
-                    close_reason = COALESCE(%s, close_reason),
-                    outcome = COALESCE(%s, outcome),
-                    r_multiple = COALESCE(%s, r_multiple),
-                    notes = COALESCE(%s, notes),
-                    entry_context = COALESCE(%s, entry_context),
-                    setup = COALESCE(%s, setup)
-                WHERE ticket = %s
-            """, (
-                trade.get("close_price"),
-                trade.get("close_ts") or (datetime.utcnow() if trade.get("status") == "closed" else None),
-                trade.get("close_reason"),
-                trade.get("outcome", "open"),
-                trade.get("r_multiple"),
-                trade.get("notes"),
-                trade.get("entry_context"),
-                trade.get("setup"),
-                ticket
-            ))
-            if cursor.rowcount == 0:
-                cursor.execute("""
+        with db_cursor() as (c, cur):
+            if ticket:
+                cur.execute(
+                    """
+                    UPDATE executed_trades SET
+                        symbol = COALESCE(%s, symbol),
+                        direction = COALESCE(%s, direction),
+                        entry_price = COALESCE(%s, entry_price),
+                        stop_loss = COALESCE(%s, stop_loss),
+                        tp1 = COALESCE(%s, tp1),
+                        tp2 = COALESCE(%s, tp2),
+                        close_price = COALESCE(%s, close_price),
+                        close_ts = COALESCE(%s, close_ts),
+                        close_reason = COALESCE(%s, close_reason),
+                        outcome = COALESCE(%s, outcome),
+                        r_multiple = COALESCE(%s, r_multiple),
+                        volume_lots = COALESCE(%s, volume_lots),
+                        notes = COALESCE(%s, notes),
+                        entry_context = COALESCE(%s, entry_context),
+                        setup = COALESCE(%s, setup)
+                    WHERE ticket = %s
+                    """,
+                    (
+                        sym,
+                        trade.get("direction"),
+                        trade.get("entry_price"),
+                        trade.get("stop_loss"),
+                        trade.get("tp1"),
+                        trade.get("tp2"),
+                        trade.get("close_price"),
+                        trade.get("close_ts") or (datetime.utcnow() if status == "closed" else None),
+                        trade.get("close_reason"),
+                        outcome,
+                        trade.get("r_multiple"),
+                        trade.get("volume_lots"),
+                        trade.get("notes"),
+                        trade.get("entry_context"),
+                        trade.get("setup"),
+                        ticket,
+                    ),
+                )
+                if cur.rowcount == 0:
+                    cur.execute(
+                        """
+                        INSERT INTO executed_trades (symbol, direction, entry_price, stop_loss, tp1, tp2,
+                            r_multiple, outcome, volume_lots, notes, ticket, close_price, close_ts,
+                            close_reason, entry_context, setup)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            sym,
+                            trade.get("direction"),
+                            trade.get("entry_price"),
+                            trade.get("stop_loss"),
+                            trade.get("tp1"),
+                            trade.get("tp2"),
+                            trade.get("r_multiple"),
+                            outcome,
+                            trade.get("volume_lots"),
+                            trade.get("notes"),
+                            ticket,
+                            trade.get("close_price"),
+                            trade.get("close_ts"),
+                            trade.get("close_reason"),
+                            trade.get("entry_context"),
+                            trade.get("setup"),
+                        ),
+                    )
+            else:
+                cur.execute(
+                    """
                     INSERT INTO executed_trades (symbol, direction, entry_price, stop_loss, tp1, tp2,
-                        r_multiple, outcome, volume_lots, notes, ticket, close_price, close_ts, close_reason, entry_context, setup)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (
-                    trade.get("symbol"), trade.get("direction"), trade.get("entry_price"), trade.get("stop_loss"),
-                    trade.get("tp1"), trade.get("tp2"), trade.get("r_multiple"), trade.get("outcome", "open"),
-                    trade.get("volume_lots"), trade.get("notes"), ticket, trade.get("close_price"),
-                    trade.get("close_ts"), trade.get("close_reason"), trade.get("entry_context"), trade.get("setup")
-                ))
-        else:
-            cursor.execute("""
-                INSERT INTO executed_trades (symbol, direction, entry_price, stop_loss, tp1, tp2, r_multiple, outcome, volume_lots, notes)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                trade.get("symbol"), trade.get("direction"), trade.get("entry_price"), trade.get("stop_loss"),
-                trade.get("tp1"), trade.get("tp2"), trade.get("r_multiple"), trade.get("outcome", "open"),
-                trade.get("volume_lots"), trade.get("notes")
-            ))
-        conn.commit()
+                        r_multiple, outcome, volume_lots, notes)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        sym,
+                        trade.get("direction"),
+                        trade.get("entry_price"),
+                        trade.get("stop_loss"),
+                        trade.get("tp1"),
+                        trade.get("tp2"),
+                        trade.get("r_multiple"),
+                        outcome,
+                        trade.get("volume_lots"),
+                        trade.get("notes"),
+                    ),
+                )
+            c.commit()
     except Exception as e:
-        try: conn.rollback()
-        except: pass
-        print("persist_trade warning:", e)
+        print(f"persist_trade warning: {e}")
+
 
 ensure_live_tables()
 

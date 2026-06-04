@@ -260,11 +260,10 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
                     signal_result["rationale"] = f"Risk veto: {veto_reason} (streak={streak}). {old_rat}".strip()
                     logger.warning(f"[RISK VETO REALTIME] {symbol} {orig} -> HOLD : {veto_reason}")
                 else:
-                    # prefer server stop from structure if present
-                    for cand in ("validated_stop", "stop_suggestion", "stop"):
-                        if cand in signal_result and signal_result.get(cand):
-                            signal_result["validated_stop"] = signal_result[cand]
-                            break
+                    from app.api.signals import _resolve_validated_stop
+                    vstop = _resolve_validated_stop(signal_result)
+                    if vstop:
+                        signal_result["validated_stop"] = vstop
     except Exception as e:
         logger.error(f"[RISK] realtime veto layer error (non-fatal): {e}")
 
@@ -304,13 +303,15 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
         # Post-entry management suggestions for any current opens on this symbol (best for the system)
         try:
             from app.db import db_cursor
+            from app.utils.symbols import symbol_sql_match
+            sym_clause, sym_params = symbol_sql_match(symbol)
             with db_cursor() as (c, cur):
-                cur.execute("""
+                cur.execute(f"""
                     SELECT ts, symbol, direction, entry_price, stop_loss, tp1, tp2, volume_lots, notes, ticket, outcome
                     FROM executed_trades
-                    WHERE symbol = %s AND (outcome = 'open' OR outcome IS NULL OR outcome = '')
+                    WHERE {sym_clause} AND (outcome = 'open' OR outcome IS NULL OR outcome = '')
                     ORDER BY ts DESC LIMIT 5
-                """, (symbol,))
+                """, sym_params)
                 opens = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
             if opens:
                 from app.features.builder import compute_structure
@@ -734,9 +735,15 @@ def _flatten_signal_for_ea(response: dict, signal_result: dict) -> None:
     response["sig_confidence"] = signal_result.get("confidence")
     response["sig_setup"] = signal_result.get("setup")
     response["sig_rationale"] = signal_result.get("rationale")
-    response["sig_stop_suggestion"] = signal_result.get("stop_suggestion")
+    stop = signal_result.get("validated_stop") or signal_result.get("stop_suggestion")
+    response["sig_stop_suggestion"] = stop
     response["sig_tp1"] = signal_result.get("tp1")
     response["sig_tp2"] = signal_result.get("tp2")
+    mgmt = signal_result.get("management")
+    if isinstance(mgmt, dict):
+        response["management_action"] = mgmt.get("action")
+        response["management_new_sl"] = mgmt.get("new_sl")
+        response["management_reason"] = mgmt.get("reason")
 
 
 def _apply_system_mode_to_signal(signal_dict: dict, symbol: str = "") -> dict:

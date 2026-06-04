@@ -34,7 +34,14 @@ def to_naive_utc(ts) -> datetime:
     if ts is None:
         return datetime.utcnow()
     if isinstance(ts, str):
-        ts = pd.to_datetime(ts, utc=True)
+        raw = ts.strip()
+        # MT5 TimeToString: "2026.06.04 12:00:00"
+        if len(raw) >= 17 and raw[4] == "." and raw[7] == ".":
+            try:
+                return datetime.strptime(raw, "%Y.%m.%d %H:%M:%S")
+            except ValueError:
+                pass
+        ts = pd.to_datetime(raw, utc=True)
     if isinstance(ts, pd.Timestamp):
         ts = ts.to_pydatetime()
     if isinstance(ts, datetime) and ts.tzinfo is not None:

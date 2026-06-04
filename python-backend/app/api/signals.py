@@ -20,6 +20,22 @@ except Exception:
 router = APIRouter()
 
 CANDLE_LIMIT = 200
+
+
+def _resolve_validated_stop(signal: dict) -> float | None:
+    """Pick a structural stop for the EA — never use current_price as SL."""
+    if not isinstance(signal, dict):
+        return None
+    for key in ("validated_stop", "stop_suggestion", "stop"):
+        val = signal.get(key)
+        if val and float(val) > 0:
+            return float(val)
+    ms = signal.get("market_structure")
+    if isinstance(ms, dict):
+        val = ms.get("stop_suggestion")
+        if val and float(val) > 0:
+            return float(val)
+    return None
 MIN_CANDLES_FOR_SIGNAL = 50  # You can lower this for testing if needed
 
 
@@ -282,18 +298,10 @@ def get_trading_signal(
             else:
                 # attach validated stop if structure provided one (for EA to prefer)
                 if isinstance(result, dict):
-                    for cand in ("validated_stop", "stop_suggestion", "stop"):
-                        if cand in result and result[cand]:
-                            risk_info["validated_stop"] = result[cand]
-                            break
-                    if "validated_stop" not in risk_info and "market_structure" in result:
-                        ms = result["market_structure"]
-                        if isinstance(ms, dict):
-                            # try common places
-                            for p in (ms.get("stop_suggestion"), ms.get("current_price")):
-                                if p:
-                                    risk_info["validated_stop"] = p
-                                    break
+                    vstop = _resolve_validated_stop(result)
+                    if vstop:
+                        risk_info["validated_stop"] = vstop
+                        result["validated_stop"] = vstop
         except Exception as e:
             print(f"[RISK] layer error (non-fatal, allowing original): {e}")
             risk_info = {"risk_error": str(e)}
