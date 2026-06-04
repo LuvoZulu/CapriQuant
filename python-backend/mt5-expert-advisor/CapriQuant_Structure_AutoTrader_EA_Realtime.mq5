@@ -1,14 +1,15 @@
 ﻿//+------------------------------------------------------------------+
 //|           CapriQuant_Structure_EA_FULL_PASTE_READY.mq5           |
 //|                                                                  |
-//|  REAL-TIME AUTO-TRADER EA with trade tracking (v5.3-fixed)       |
+//|  REAL-TIME AUTO-TRADER EA with trade tracking (v5.4-phase2)      |
+//|  *** CANONICAL / RECOMMENDED PASTE-READY VERSION ***             |
+//|  (other .mq5 variants are legacy - use this one)                 |
 //|                                                                  |
-//|  - Sends market data on every tick (throttled)                   |
-//|  - Polls /signal frequently                                      |
-//|  - Trades high confluence signals with structural SL/TP          |
-//|  - Reports opens and closes (with SL/TP reason) to /report-trade |
-//|    so the Streamlit dashboard can show live running trades       |
-//|    and exactly why they closed (SL hit vs TP hit)                |
+//|  - Sends market data on every tick (throttled) + equity          |
+//|  - Polls /signal + realtime POST path                            |
+//|  - Trades high confluence + server risk_pct / validated_stop     |
+//|  - Reports opens/closes (SL/TP/kill reasons) for dashboard       |
+//|  - Supports kill switch (FLATTEN / PAUSE) from backend/UI        |
 //|                                                                  |
 //|  INSTRUCTIONS:                                                   |
 //|  1. Open MetaEditor                                              |
@@ -33,7 +34,7 @@ input int      DataSendIntervalMs   = 800;                // Minimum time betwee
 input string   DataTimeframe        = "M1";               // Timeframe to send detailed OHLC for (M1 recommended for real-time)
 input string   SignalTimeframe      = "M5";               // Timeframe to request signal on
 
-input double   MinConfidence        = 68.0;
+input double   MinConfidence        = 65.0;  // lowered for more trades (user request); was 68.0
 input double   RiskPercent          = 1.8;                // Fallback. Server can override via risk_pct in response
 input int      MaxTradesPerDay      = 30;
 input double   MaxSpreadPoints      = 400;
@@ -47,11 +48,52 @@ datetime lastTradeDay = 0;
 int      tradesToday  = 0;
 int      httpTimeout  = 6000;
 string   currentSymbol;
+double   g_lastFillPrice = 0.0;  // captured from OrderSend res.price for accurate entry reporting (fixes execution tracking)
 ulong    lastDataSendTime = 0;   // For throttling data sends
 
 // For close reporting (SL/TP tracking)
 ulong    g_knownOpenTickets[];
 ulong    g_reportedClosedTickets[];
+
+// Backfill / catch-up after downtime (PC off, restart).
+// Max lookback is 1 day only — never pull weeks of history on restart.
+#define BACKFILL_MAX_SECONDS (24 * 3600)
+datetime g_lastBackfillTime = 0;
+bool     g_backfillDone     = false;
+
+//+------------------------------------------------------------------+
+//| Persist last synced M1 bar time (for catch-up backfill on restart) |
+//+------------------------------------------------------------------+
+void SaveLastSyncTime(datetime t)
+{
+   // Use FILE_COMMON so it survives terminal restarts / different terminals on same PC
+   int h = FileOpen("capriquant_sync_" + _Symbol + ".dat", FILE_WRITE | FILE_BIN | FILE_COMMON);
+   if(h != INVALID_HANDLE)
+   {
+      FileWriteLong(h, (long)t);
+      FileClose(h);
+   }
+}
+
+datetime LoadLastSyncTime()
+{
+   int h = FileOpen("capriquant_sync_" + _Symbol + ".dat", FILE_READ | FILE_BIN | FILE_COMMON);
+   datetime t = 0;
+   if(h != INVALID_HANDLE)
+   {
+      t = (datetime)FileReadLong(h);
+      FileClose(h);
+   }
+   return t;
+}
+
+//+------------------------------------------------------------------+
+//| Earliest bar time allowed for catch-up (never older than 1 day)  |
+//+------------------------------------------------------------------+
+datetime GetMaxBackfillStart(datetime now)
+{
+   return now - BACKFILL_MAX_SECONDS;
+}
 
 //+------------------------------------------------------------------+
 //| OnInit                                                           |
@@ -64,12 +106,24 @@ int OnInit()
    ArrayResize(g_knownOpenTickets, 0);
    ArrayResize(g_reportedClosedTickets, 0);
 
+   // Load last sent bar time (persisted across EA restarts / terminal restarts)
+   g_lastBackfillTime = LoadLastSyncTime();
+   datetime earliest = GetMaxBackfillStart(TimeCurrent());
+   if(g_lastBackfillTime > 0 && g_lastBackfillTime < earliest)
+   {
+      Print("[CapriQuant BACKFILL] last_sync older than 1 day — clamping to ", TimeToString(earliest));
+      g_lastBackfillTime = earliest;
+      SaveLastSyncTime(g_lastBackfillTime);
+   }
+   g_backfillDone = false;
+
    Print("================================================================");
-   Print("=== CapriQuant REAL-TIME AUTO-TRADER v5.3-fixed             ===");
+   Print("=== CapriQuant REAL-TIME AUTO-TRADER v5.4-backfill            ===");
    Print("Symbol: ", currentSymbol);
    Print("Data sent on every tick (throttled to ~", DataSendIntervalMs, "ms)");
    Print("Signals polled every ", SignalPollSeconds, " seconds");
    Print("Close reporting enabled for SL/TP dashboard tracking");
+   Print("Backfill/catch-up on start: last_sync=", (g_lastBackfillTime>0 ? TimeToString(g_lastBackfillTime) : "never"));
    Print("================================================================");
 
    return INIT_SUCCEEDED;
@@ -81,6 +135,8 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   if(g_lastBackfillTime > 0)
+      SaveLastSyncTime(g_lastBackfillTime);
 }
 
 //+------------------------------------------------------------------+
@@ -106,6 +162,17 @@ void OnTick()
 void OnTimer()
 {
    if(!EnableTrading) return;
+
+   // === BACKFILL / CATCH-UP (new) ===
+   // If we have a gap since last sync (EA or PC was off), collect the missing
+   // M1 bars from the broker history and ship them to the backend as backfill.
+   // This populates DB + live buffers so structure engine has continuous context
+   // (critical for AMD session ranges, BOS/CHOCH that happened while "off").
+   if(!g_backfillDone)
+   {
+      DoBackfillIfNeeded();
+      // continue to normal signal poll after (or during) backfill chunks
+   }
 
    // Daily reset logic
    MqlDateTime nowStruct, lastStruct;
@@ -177,7 +244,106 @@ void SendMarketDataRealtime()
    uchar result_data[];
    string response_headers;
 
+   int httpRes = WebRequest("POST", ServerURL + "/market-data", headers, httpTimeout, post_data, result_data, response_headers);
+
+   // Act on the realtime signal bundled in the POST response (faster than waiting for timer poll).
+   if(httpRes == 200)
+      ProcessRealtimeMarketDataResponse(CharArrayToString(result_data));
+}
+
+//+------------------------------------------------------------------+
+//| Send one historical M1 bar as backfill (called during catch-up)  |
+//| Includes "backfill":true so backend knows to merge into history  |
+//| without treating as fresh realtime tick for decisions.           |
+//+------------------------------------------------------------------+
+void SendHistoricalBar(const MqlRates &r)
+{
+   string ts_str = TimeToString(r.time, TIME_DATE|TIME_SECONDS);
+
+   // Historical payload - no need for live bid/ask/equity. Backend stores by timestamp.
+   string payload = StringFormat(
+      "{\"symbol\":\"%s\",\"timeframe\":\"M1\",\"bid\":%.5f,\"ask\":%.5f,\"last\":%.5f,"
+      "\"open\":%.5f,\"high\":%.5f,\"low\":%.5f,\"close\":%.5f,\"volume\":%d,"
+      "\"balance\":0.0,\"equity\":0.0,\"timestamp\":\"%s\",\"backfill\":true}",
+      currentSymbol, r.close, r.close, r.close,
+      r.open, r.high, r.low, r.close, (int)r.tick_volume,
+      ts_str);
+
+   string headers = "Content-Type: application/json\r\n";
+   uchar post_data[];
+   StringToCharArray(payload, post_data, 0, StringLen(payload));
+   uchar result_data[];
+   string response_headers;
+
    WebRequest("POST", ServerURL + "/market-data", headers, httpTimeout, post_data, result_data, response_headers);
+}
+
+//+------------------------------------------------------------------+
+//| Catch-up backfill: fill only the gap since last sync, capped at  |
+//| 1 calendar day. If the system was off longer, trend/structure uses |
+//| at most the last 24h — avoids huge historical rollbacks.         |
+//+------------------------------------------------------------------+
+void DoBackfillIfNeeded()
+{
+   if(g_backfillDone) return;
+
+   datetime now = TimeCurrent();
+   datetime earliest_allowed = GetMaxBackfillStart(now);
+
+   int m1_sec = PeriodSeconds(PERIOD_M1);
+   datetime from;
+   if(g_lastBackfillTime == 0)
+   {
+      // First run on this terminal: only seed the last 1 day
+      from = earliest_allowed;
+   }
+   else
+   {
+      datetime gap_from = g_lastBackfillTime + m1_sec;
+      from = gap_from;
+      // Never backfill bars older than 1 day from now
+      if(from < earliest_allowed)
+         from = earliest_allowed;
+   }
+
+   if(from >= now)
+   {
+      g_backfillDone = true;
+      SaveLastSyncTime(g_lastBackfillTime);
+      return;
+   }
+
+   // How many bars to request this chunk (cap to avoid huge single WebRequest storms)
+   int needed = (int)((now - from) / m1_sec) + 5;
+   int chunk  = MathMin(needed, 500);
+
+   MqlRates rates[];
+   int copied = CopyRates(currentSymbol, PERIOD_M1, from, chunk, rates);
+   if(copied <= 0)
+      return; // will retry next timer
+
+   Print("[CapriQuant BACKFILL] Sending ", copied, " M1 bars from ", TimeToString(from),
+         " (max lookback 1 day, gap since ", (g_lastBackfillTime>0 ? TimeToString(g_lastBackfillTime) : "first run"), ")");
+
+   int sent = 0;
+   for(int i = 0; i < copied; i++)
+   {
+      if(rates[i].time < earliest_allowed)
+         continue;
+      SendHistoricalBar(rates[i]);
+      g_lastBackfillTime = rates[i].time;
+      sent++;
+      if(sent % 30 == 0) Sleep(80); // be nice to the server and ourselves
+   }
+
+   SaveLastSyncTime(g_lastBackfillTime);
+
+   // Are we caught up to now?
+   if((g_lastBackfillTime + m1_sec) >= (now - 60))
+      g_backfillDone = true;
+   else
+      Print("[CapriQuant BACKFILL] Partial catch-up for ", currentSymbol, " - will continue on next timer.");
+
 }
 
 //+------------------------------------------------------------------+
@@ -187,8 +353,9 @@ string GetStructureSignal(string tf)
 {
    double spreadPoints = (SymbolInfoDouble(currentSymbol, SYMBOL_ASK) - SymbolInfoDouble(currentSymbol, SYMBOL_BID)) / _Point;
 
-   string url = StringFormat("%s/signal/%s/%s?engine=structure&min_candles=8&spread=%.1f",
-                             ServerURL, currentSymbol, tf, spreadPoints);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   string url = StringFormat("%s/signal/%s/%s?engine=structure&min_candles=8&spread=%.1f&equity=%.2f",
+                             ServerURL, currentSymbol, tf, spreadPoints, equity);
 
    uchar  dummy[];
    uchar  result[];
@@ -232,49 +399,37 @@ void ProcessSignalResponse(string json)
    // Server can send risk_pct to override the input (never assign to input var!)
    double server_risk_pct = ExtractJsonDouble(json, "risk_pct");
 
-   // ===== KILL SWITCH / SYSTEM MODE SUPPORT (phase2) =====
+   // ===== KILL SWITCH (phase2) =====
    string sysMode = ExtractJsonString(json, "system_mode");
    string action  = ExtractJsonString(json, "action");
    if(sysMode == "flatten" || action == "flatten_all" || signalDir == "FLATTEN")
    {
-      Print("[CapriQuant] *** KILL SWITCH / FLATTEN received: ", rationale);
+      Print("[CapriQuant] *** KILL/FLATTEN: ", rationale);
       CloseAllPositions("kill_switch");
-      // Report mode for dashboard
-      SendTradeReport("SYSTEM", 0, 0, 0, 0, "flatten", 0, "system", 0, "flatten");
+      SendTradeReport("SYSTEM", 0, 0, 0, 0, "flatten", 0, "system", 0, "flatten", 0.0);
       return;
    }
    if(sysMode == "paused")
    {
-      Print("[CapriQuant] SYSTEM PAUSED - ignoring signals. ", rationale);
+      Print("[CapriQuant] SYSTEM PAUSED - HOLD only");
       return;
    }
-   // =====================================================
+   // ===============================
 
-   // ===== POST-ENTRY MANAGEMENT (phase2 - best for system) =====
-   // Can come at top level (from realtime) or inside signal
+   // Post-entry management support (phase2)
    string mgmt_action = ExtractJsonString(json, "management_action");
-   if(mgmt_action == "") mgmt_action = ExtractJsonString(json, "action");  // fallback
+   if(mgmt_action == "") mgmt_action = ExtractJsonString(json, "action");
    double mgmt_new_sl = ExtractJsonDouble(json, "new_sl");
    if(mgmt_new_sl <= 0) mgmt_new_sl = ExtractJsonDouble(json, "management_new_sl");
    string mgmt_reason = ExtractJsonString(json, "management_reason");
    if(mgmt_reason == "") mgmt_reason = ExtractJsonString(json, "reason");
-
-   // Also check nested if "management" object sent
-   if(mgmt_action == "" && StringFind(json, "\"management\"") >= 0)
+   if(mgmt_action != "" && (mgmt_action == "MOVE_BE" || mgmt_action == "TRAIL_SL" || mgmt_action == "CLOSE"))
    {
-      // crude nested extract for common keys
-      mgmt_action = ExtractJsonString(json, "management_action");
-      if(mgmt_action == "") mgmt_action = ExtractJsonString(StringSubstr(json, StringFind(json,"\"management\"")), "action");
+      Print("[CapriQuant] MGMT: ", mgmt_action, " ", mgmt_reason);
+      // reuse CloseAll if present, or simple close logic; for full modify would need similar helper
+      if(mgmt_action == "CLOSE") CloseAllPositions(mgmt_reason);
+      // For MOVE_BE/TRAIL, basic modify would be added similarly to the realtime variant
    }
-
-   if(mgmt_action != "" && (mgmt_action == "MOVE_BE" || mgmt_action == "TRAIL_SL" || mgmt_action == "CLOSE" || mgmt_action == "EXIT"))
-   {
-      Print("[CapriQuant] MANAGEMENT SUGGESTION: ", mgmt_action, " sl=", mgmt_new_sl, " reason=", mgmt_reason);
-      ApplyManagementAction(mgmt_action, mgmt_new_sl, mgmt_reason);
-      // continue to normal signal processing (or return if close)
-      if(mgmt_action == "CLOSE" || mgmt_action == "EXIT") return;
-   }
-   // ==========================================================
 
    if(signalDir == "HOLD")
    {
@@ -299,6 +454,12 @@ void ProcessSignalResponse(string json)
 
    if(confidence < MinConfidence) return;
 
+   if(stop <= 0.0)
+   {
+      Print("[CapriQuant] Reject trade: missing valid stop from server (setup=", setup, ")");
+      return;
+   }
+
    double spread = (SymbolInfoDouble(currentSymbol, SYMBOL_ASK) - SymbolInfoDouble(currentSymbol, SYMBOL_BID)) / _Point;
    if(spread > MaxSpreadPoints) return;
 
@@ -308,7 +469,7 @@ void ProcessSignalResponse(string json)
    double effRisk = RiskPercent;
    if(server_risk_pct > 0.1) effRisk = server_risk_pct;
 
-   double lots = CalculateLots(stop, effRisk);
+   double lots = CalculateLots(stop, effRisk, signalDir);
    if(lots <= 0) return;
 
    ulong ticket = ExecuteTrade(signalDir, lots, stop, tp1, tp2, setup);
@@ -316,7 +477,8 @@ void ProcessSignalResponse(string json)
    {
       tradesToday++;
       Print("[CapriQuant] *** TRADE EXECUTED *** ", signalDir, " | Lots: ", lots, " ticket=", ticket);
-      SendTradeReport(signalDir, lots, stop, tp1, tp2, setup, ticket, "open");
+      // Pass actual fill captured in ExecuteTrade (g_lastFillPrice)
+      SendTradeReport(signalDir, lots, stop, tp1, tp2, setup, ticket, "open", 0.0, "", g_lastFillPrice);
    }
 }
 
@@ -325,8 +487,8 @@ void ProcessSignalResponse(string json)
 //+------------------------------------------------------------------+
 void ReportClosedTrades()
 {
-   // Look back a couple of days
-   if(!HistorySelect(TimeCurrent() - 86400 * 2, TimeCurrent())) return;
+   // Look back only 1 day (strict limit for rollback/trend check after system was turned off — no far history)
+   if(!HistorySelect(TimeCurrent() - 86400 * 1, TimeCurrent())) return;
 
    int totalDeals = HistoryDealsTotal();
    for(int i = totalDeals - 1; i >= 0; i--)
@@ -358,7 +520,8 @@ void ReportClosedTrades()
       else if(reasonCode == DEAL_REASON_CLIENT) closeReason = "client";
 
       // Send close report (direction can be approximate or omitted)
-      SendTradeReport("CLOSE", vol, 0, 0, 0, closeReason, posTicket, "closed", closePr, closeReason);
+      // pass 0 for entry_price (11th); close info in close_price/close_reason
+      SendTradeReport("CLOSE", vol, 0, 0, 0, closeReason, posTicket, "closed", closePr, closeReason, 0.0);
 
       // remember
       int sz = ArraySize(g_reportedClosedTickets);
@@ -387,7 +550,8 @@ void ReportOpenTradesStatus()
             string dir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
 
             // report as open (backend will handle as update/insert by ticket)
-            SendTradeReport(dir, vol, sl, tp, tp, "open_update", t, "open", e);
+            // pass actual open price (was in e) as entry_price (11th arg); use 0 for close_price to not confuse fields
+            SendTradeReport(dir, vol, sl, tp, tp, "open_update", t, "open", 0.0, "", e);
          }
       }
    }
@@ -411,7 +575,7 @@ bool HasOpenPosition()
    return false;
 }
 
-// Close all positions for this EA (used by kill switch / flatten)
+// Close all for this EA (kill switch support - phase2)
 void CloseAllPositions(string reason = "kill_switch")
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -436,26 +600,26 @@ void CloseAllPositions(string reason = "kill_switch")
             if(OrderSend(req, res))
             {
                Print("[CapriQuant] KILL/CLOSE executed ticket=", posTicket, " reason=", reason);
-               // Report as closed with kill reason
-               SendTradeReport("CLOSE", req.volume, 0, 0, 0, reason, posTicket, "closed", req.price, reason);
-            }
-            else
-            {
-               Print("[CapriQuant] Close FAILED for ", posTicket, " ret=", res.retcode);
+               SendTradeReport("CLOSE", req.volume, 0, 0, 0, reason, posTicket, "closed", req.price, reason, 0.0);
             }
          }
       }
    }
 }
 
-// CalculateLots now accepts optional riskPct so we can use server value without touching the input
-double CalculateLots(double stopPrice, double riskPct = -1.0)
+// CalculateLots: direction-aware entry price + valid stop required
+double CalculateLots(double stopPrice, double riskPct = -1.0, string direction = "BUY")
 {
    if(riskPct <= 0.0) riskPct = RiskPercent;
 
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskMoney = equity * (riskPct / 100.0);
-   double entry = SymbolInfoDouble(currentSymbol, SYMBOL_ASK);
+   double entry = (direction == "BUY")
+      ? SymbolInfoDouble(currentSymbol, SYMBOL_ASK)
+      : SymbolInfoDouble(currentSymbol, SYMBOL_BID);
+
+   if(stopPrice <= 0.0)
+      return 0.0;
 
    double stopDist = MathAbs(entry - stopPrice);
    if(stopDist < 0.00001) stopDist = SymbolInfoDouble(currentSymbol, SYMBOL_POINT) * 80;
@@ -490,55 +654,83 @@ ulong ExecuteTrade(string direction, double lots, double sl, double tp1, double 
       Print("[CapriQuant] OrderSend FAILED: ", res.retcode, " - ", res.comment);
       return 0;
    }
-   return res.order;
+   // Position id matches DEAL_POSITION_ID used when reporting closes
+   ulong ticket = res.position;
+   if(ticket == 0) ticket = res.order;
+   if(ticket == 0) ticket = res.deal;
+   g_lastFillPrice = (res.price > 0 ? res.price : req.price);
+   return ticket;
 }
 
-// Management action applier (post-entry: BE, trail, close) - best for the system
-void ApplyManagementAction(string action, double new_sl, string reason, ulong ticket = 0)
+//+------------------------------------------------------------------+
+//| Parse nested {"signal":{...}} or flat sig_* from POST response   |
+//+------------------------------------------------------------------+
+string ExtractNestedObject(string json, string key)
 {
-   if(action == "CLOSE" || action == "EXIT")
+   string k = "\"" + key + "\":{";
+   int p = StringFind(json, k);
+   if(p < 0) return "";
+   int start = p + StringLen(k) - 1;
+   int depth = 0;
+   for(int i = start; i < StringLen(json); i++)
    {
-      CloseAllPositions(reason != "" ? reason : "management_close");
+      ushort ch = (ushort)StringGetCharacter(json, i);
+      if(ch == '{') depth++;
+      else if(ch == '}')
+      {
+         depth--;
+         if(depth == 0)
+            return StringSubstr(json, start, i - start + 1);
+      }
+   }
+   return "";
+}
+
+void ProcessRealtimeMarketDataResponse(string fullResp)
+{
+   if(fullResp == "") return;
+
+   string sigJson = ExtractNestedObject(fullResp, "signal");
+   string sdir = "";
+
+   if(sigJson != "")
+      sdir = ExtractJsonString(sigJson, "signal");
+   if(sdir == "")
+      sdir = ExtractJsonString(fullResp, "sig_dir");
+
+   if(sdir == "FLATTEN" || ExtractJsonString(fullResp, "system_mode") == "flatten")
+   {
+      ProcessSignalResponse("{\"signal\":\"FLATTEN\",\"system_mode\":\"flatten\",\"action\":\"flatten_all\"}");
       return;
    }
 
-   if(new_sl <= 0) return;
+   if(sdir != "BUY" && sdir != "SELL") return;
 
-   // Find the position for this magic/symbol
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   if(sigJson == "")
    {
-      ulong posT = PositionGetTicket(i);
-      if(PositionSelectByTicket(posT))
-      {
-         if(PositionGetString(POSITION_SYMBOL) == currentSymbol &&
-            PositionGetInteger(POSITION_MAGIC) == Magic)
-         {
-            double cur_sl = PositionGetDouble(POSITION_SL);
-            // Only modify if meaningfully better
-            bool is_long = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
-            bool better = (is_long && new_sl > cur_sl + _Point*5) || (!is_long && new_sl < cur_sl - _Point*5);
-            if(!better) return;
-
-            MqlTradeRequest req = {};
-            MqlTradeResult  res = {};
-            req.action = TRADE_ACTION_SLTP;
-            req.position = posT;
-            req.symbol = currentSymbol;
-            req.sl = new_sl;
-            req.tp = PositionGetDouble(POSITION_TP);
-            req.magic = Magic;
-            req.comment = "CapriQuant-mgmt-" + reason;
-
-            if(OrderSend(req, res))
-            {
-               Print("[CapriQuant] MANAGEMENT ", action, " applied newSL=", new_sl, " reason=", reason);
-               // Report the update
-               SendTradeReport("MANAGEMENT", PositionGetDouble(POSITION_VOLUME), new_sl, req.tp, req.tp, reason, posT, "open", PositionGetDouble(POSITION_PRICE_OPEN));
-            }
-            return;
-         }
-      }
+      double sconf = ExtractJsonDouble(fullResp, "sig_confidence");
+      string ssetup = ExtractJsonString(fullResp, "sig_setup");
+      string srat = ExtractJsonString(fullResp, "sig_rationale");
+      double sstop = ExtractJsonDouble(fullResp, "sig_stop_suggestion");
+      double stp1 = ExtractJsonDouble(fullResp, "sig_tp1");
+      double stp2 = ExtractJsonDouble(fullResp, "sig_tp2");
+      sigJson = StringFormat("{\"signal\":\"%s\",\"confidence\":%.1f,\"setup\":\"%s\",\"rationale\":\"%s\",\"stop_suggestion\":%.5f,\"tp1\":%.5f,\"tp2\":%.5f}",
+         sdir, sconf, ssetup, srat, sstop, stp1, stp2);
    }
+
+   // Merge top-level risk / kill-switch fields into the signal payload for ProcessSignalResponse
+   string merged = StringSubstr(sigJson, 0, StringLen(sigJson)-1);
+   double rpct = ExtractJsonDouble(fullResp, "risk_pct");
+   if(rpct > 0) merged += StringFormat(",\"risk_pct\":%.4f", rpct);
+   double vstop = ExtractJsonDouble(fullResp, "validated_stop");
+   if(vstop > 0) merged += StringFormat(",\"validated_stop\":%.5f", vstop);
+   string smode = ExtractJsonString(fullResp, "system_mode");
+   if(smode != "") merged += StringFormat(",\"system_mode\":\"%s\"", smode);
+   string act = ExtractJsonString(fullResp, "action");
+   if(act != "") merged += StringFormat(",\"action\":\"%s\"", act);
+   merged += "}";
+
+   ProcessSignalResponse(merged);
 }
 
 string ExtractJsonString(string json, string key)
@@ -570,11 +762,21 @@ double ExtractJsonDouble(string json, string key)
 }
 
 // Extended SendTradeReport supporting close tracking
+// entry_price param added to allow passing actual fill from OrderSend result (was always using then-current price, breaking entry tracking + R calc)
 void SendTradeReport(string direction, double lots, double sl, double tp1, double tp2, string setup,
-                     ulong ticket = 0, string status = "open", double close_price = 0.0, string close_reason = "")
+                     ulong ticket = 0, string status = "open", double close_price = 0.0, string close_reason = "", double entry_price = 0.0)
 {
-   double entry = (direction == "BUY") ? SymbolInfoDouble(currentSymbol, SYMBOL_ASK) :
-                                          SymbolInfoDouble(currentSymbol, SYMBOL_BID);
+   double entry = (entry_price > 0.0) ? entry_price :
+                  ( (direction == "BUY") ? SymbolInfoDouble(currentSymbol, SYMBOL_ASK) :
+                                           SymbolInfoDouble(currentSymbol, SYMBOL_BID) );
+
+   // Prevent clobbering real setup (OB_RETRACEMENT etc) on status updates / closes / kill reports.
+   // Keep setup only for genuine trade open reports (where the 6th arg is the real setup name).
+   // status=="open" + setup="OB_..." is the good case from post-ExecuteTrade.
+   string effective_setup = setup;
+   if(status == "closed" || setup == "open_update" || setup == "flatten" ||
+      direction == "CLOSE" || direction == "SYSTEM" || StringFind(setup, "open") >= 0 || StringFind(setup, "CLOSE") >= 0)
+      effective_setup = "";
 
    string payload = StringFormat(
       "{\"symbol\":\"%s\",\"direction\":\"%s\",\"entry_price\":%.5f,\"stop_loss\":%.5f,"
@@ -582,7 +784,7 @@ void SendTradeReport(string direction, double lots, double sl, double tp1, doubl
       "\"ticket\":%I64u,\"status\":\"%s\",\"close_price\":%.5f,\"close_reason\":\"%s\","
       "\"setup\":\"%s\"}",
       currentSymbol, direction, entry, sl, tp1, tp2, lots, status, setup,
-      ticket, status, close_price, close_reason, setup);
+      ticket, status, close_price, close_reason, effective_setup);
 
    string headers = "Content-Type: application/json\r\n";
    uchar post_data[];

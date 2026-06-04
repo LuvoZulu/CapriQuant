@@ -11,15 +11,41 @@ from app.db import get_recent_loss_streak, get_today_realized_r
 from app.config import get_settings
 
 # For kill switch / system mode (shared with main)
-try:
-    from main import get_system_mode, _apply_system_mode_to_signal  # type: ignore
-except Exception:
-    def get_system_mode(): return "trading"
-    def _apply_system_mode_to_signal(d, s=""): return d
+# NOTE: lazy import inside funcs to avoid fragile top-level cross import (main <-> app.api.signals)
+# which could cause dummy always-trading funcs and kill/pause ignored on /signal poll path from EA.
+def get_system_mode():
+    try:
+        from main import get_system_mode as _gm
+        return _gm()
+    except Exception:
+        return "trading"
+
+def _apply_system_mode_to_signal(d, s=""):
+    try:
+        from main import _apply_system_mode_to_signal as _ap
+        return _ap(d, s)
+    except Exception:
+        return d
 
 router = APIRouter()
 
 CANDLE_LIMIT = 200
+
+
+def _resolve_validated_stop(signal: dict) -> float | None:
+    """Pick a structural stop for the EA — never use current_price as SL."""
+    if not isinstance(signal, dict):
+        return None
+    for key in ("validated_stop", "stop_suggestion", "stop"):
+        val = signal.get(key)
+        if val and float(val) > 0:
+            return float(val)
+    ms = signal.get("market_structure")
+    if isinstance(ms, dict):
+        val = ms.get("stop_suggestion")
+        if val and float(val) > 0:
+            return float(val)
+    return None
 MIN_CANDLES_FOR_SIGNAL = 50  # You can lower this for testing if needed
 
 
@@ -39,10 +65,12 @@ def normalize_symbol(symbol: str) -> str:
 def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min_candles_override: int = None) -> pd.DataFrame:
     normalized_symbol = normalize_symbol(symbol)
 
+    max_hours = float(get_settings().catchup_max_hours)
     query = """
         SELECT timestamp, open, high, low, close, tick_volume as volume
         FROM market_data
         WHERE symbol = %s AND timeframe = %s
+          AND timestamp >= NOW() - (%s * INTERVAL '1 hour')
         ORDER BY timestamp DESC
         LIMIT %s
     """
@@ -50,12 +78,12 @@ def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min
     from app.db import db_cursor
     try:
         with db_cursor() as (c, cur):
-            cur.execute(query, (normalized_symbol, timeframe, CANDLE_LIMIT))
+            cur.execute(query, (normalized_symbol, timeframe, max_hours, CANDLE_LIMIT))
             rows = cur.fetchall()
     except Exception:
         # legacy fallback
         cursor = conn.cursor()
-        cursor.execute(query, (normalized_symbol, timeframe, CANDLE_LIMIT))
+        cursor.execute(query, (normalized_symbol, timeframe, max_hours, CANDLE_LIMIT))
         rows = cursor.fetchall()
         cursor.close()
 
@@ -151,9 +179,14 @@ def get_trading_signal(
                 c.rollback()
             except:
                 pass
+            max_hours = float(get_settings().catchup_max_hours)
             cursor.execute(
-                "SELECT COUNT(*) FROM market_data WHERE symbol = %s AND timeframe = %s",
-                (normalized, tf_upper)
+                """
+                SELECT COUNT(*) FROM market_data
+                WHERE symbol = %s AND timeframe = %s
+                  AND timestamp >= NOW() - (%s * INTERVAL '1 hour')
+                """,
+                (normalized, tf_upper, max_hours),
             )
             candles_available = cursor.fetchone()[0] or 0
     except Exception as e:
@@ -229,7 +262,7 @@ def get_trading_signal(
 
     if engine in ("structure", "mtf", "structure_mtf"):
         try:
-            log_signal(result)
+            log_signal(result, symbol=normalized, timeframe=tf_upper)
         except Exception:
             pass
 
@@ -282,18 +315,10 @@ def get_trading_signal(
             else:
                 # attach validated stop if structure provided one (for EA to prefer)
                 if isinstance(result, dict):
-                    for cand in ("validated_stop", "stop_suggestion", "stop"):
-                        if cand in result and result[cand]:
-                            risk_info["validated_stop"] = result[cand]
-                            break
-                    if "validated_stop" not in risk_info and "market_structure" in result:
-                        ms = result["market_structure"]
-                        if isinstance(ms, dict):
-                            # try common places
-                            for p in (ms.get("stop_suggestion"), ms.get("current_price")):
-                                if p:
-                                    risk_info["validated_stop"] = p
-                                    break
+                    vstop = _resolve_validated_stop(result)
+                    if vstop:
+                        risk_info["validated_stop"] = vstop
+                        result["validated_stop"] = vstop
         except Exception as e:
             print(f"[RISK] layer error (non-fatal, allowing original): {e}")
             risk_info = {"risk_error": str(e)}

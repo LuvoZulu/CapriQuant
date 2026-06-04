@@ -10,9 +10,10 @@ This makes the buffer (and debug/UI) show data immediately and the numbers updat
 from collections import deque
 from typing import Dict, Optional, Deque, Any, List
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from app.utils.symbols import normalize_symbol, symbol_variants
+from app.config import get_settings
 
 # Per-symbol buffer of M1 bars (last one is the current forming minute, updated live)
 LIVE_BARS: Dict[str, Deque[dict]] = {}
@@ -26,6 +27,43 @@ MAX_COMPLETED_BARS = 10080
 MAX_M5_BARS = MAX_COMPLETED_BARS // 5
 
 
+def catchup_max_hours() -> float:
+    return float(get_settings().catchup_max_hours)
+
+
+def catchup_cutoff() -> datetime:
+    """Earliest bar time allowed for live trend / structure after downtime. Strictly max 1 day (no far rollback)."""
+    hours = min(24.0, catchup_max_hours())
+    return datetime.utcnow() - timedelta(hours=hours)
+
+
+def is_within_catchup_window(ts) -> bool:
+    """True if timestamp is recent enough for catch-up / post-restart trend analysis."""
+    if ts is None:
+        return True
+    try:
+        bar_ts = to_naive_utc(ts)
+    except Exception:
+        return False
+    return bar_ts >= catchup_cutoff()
+
+
+def filter_df_to_catchup_window(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Keep only bars within the catch-up window (strict max last 1 day after system off for trend checks)."""
+    if df is None or not hasattr(df, "empty") or df.empty:
+        return df
+    cutoff = catchup_cutoff()
+    out = df.copy()
+    out["timestamp"] = out["timestamp"].apply(to_naive_utc)
+    out = out[out["timestamp"] >= cutoff]
+    if out.empty:
+        return out
+    max_bars = int(get_settings().catchup_max_m1_bars)
+    if len(out) > max_bars:
+        out = out.tail(max_bars)
+    return out.reset_index(drop=True)
+
+
 def to_naive_utc(ts) -> datetime:
     """
     Normalize any timestamp to naive UTC (no tzinfo).
@@ -34,7 +72,14 @@ def to_naive_utc(ts) -> datetime:
     if ts is None:
         return datetime.utcnow()
     if isinstance(ts, str):
-        ts = pd.to_datetime(ts, utc=True)
+        raw = ts.strip()
+        # MT5 TimeToString: "2026.06.04 12:00:00"
+        if len(raw) >= 17 and raw[4] == "." and raw[7] == ".":
+            try:
+                return datetime.strptime(raw, "%Y.%m.%d %H:%M:%S")
+            except ValueError:
+                pass
+        ts = pd.to_datetime(raw, utc=True)
     if isinstance(ts, pd.Timestamp):
         ts = ts.to_pydatetime()
     if isinstance(ts, datetime) and ts.tzinfo is not None:
@@ -123,6 +168,10 @@ def add_market_data(symbol: str, data: dict) -> None:
     volume = float(data.get("volume", 0))
 
     bar_minute = _floor_to_minute(ts)
+
+    # Reject stale historical bars (EA backfill mistakes or old DB replay)
+    if not is_within_catchup_window(bar_minute):
+        return
 
     if not buffer:
         # First ever bar for this symbol
@@ -265,13 +314,19 @@ def get_recent_closed_df(symbol: str, limit: Optional[int] = None) -> Optional[p
 def get_recent_df_for_structure(symbol: str, limit: Optional[int] = None) -> Optional[pd.DataFrame]:
     """
     Convenience wrapper for structure analysis:
-    Prefer closed (non-forming) bars. If that would give None or empty, fall back to any recent data.
-    This prevents the pandas "truth value of DataFrame is ambiguous" error when doing `df or fallback`.
+    Prefer closed (non-forming) bars within the catch-up window (strict 1 day max).
+    Never uses >1d history for post-downtime trend/structure decisions (user-required rollback limit).
     """
-    df = get_recent_closed_df(symbol, limit)
-    if df is None or (hasattr(df, 'empty') and df.empty):
-        df = get_recent_df(symbol, limit)
-    return df
+    eff_limit = limit
+    if eff_limit is None:
+        eff_limit = int(get_settings().catchup_max_m1_bars)
+    else:
+        eff_limit = min(eff_limit, int(get_settings().catchup_max_m1_bars))
+
+    df = get_recent_closed_df(symbol, eff_limit)
+    if df is None or (hasattr(df, "empty") and df.empty):
+        df = get_recent_df(symbol, eff_limit)
+    return filter_df_to_catchup_window(df)
 
 
 def get_buffer_status(symbol: str) -> Dict[str, Any]:
@@ -332,6 +387,10 @@ def seed_buffer(symbol: str, bars: list, merge: bool = True) -> int:
         })
 
     normalized.sort(key=lambda x: x["timestamp"])
+    cutoff = catchup_cutoff()
+    normalized = [b for b in normalized if b["timestamp"] >= cutoff]
+    if not normalized:
+        return 0
     # dedupe by minute
     deduped = []
     seen = set()
