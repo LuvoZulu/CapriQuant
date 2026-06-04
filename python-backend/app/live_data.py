@@ -4,9 +4,11 @@ Live Data Buffer for real-time TICK to M1 aggregation (simpler updating logic).
 Supports the real-time POST /market-data path.
 Buffer size now strictly 1440 M1 bars (1 day) — per requirement to limit trend/structure checks and displays after system off / restart.
 No more 8000+ candle buffers; 1 trading day has 1440 M1 candles (24h * 60).
+The deque uses maxlen=1441 to hold up to 1440 completed + the current forming minute.
 The last entry in the buffer for a symbol is always the current forming minute and gets updated live on every call within the minute.
 This makes the buffer (and debug/UI) show data immediately and the numbers update on every incoming payload.
 Data comes directly from the market (via EA TICK/M1 payloads), not DB.
+New bars are ALWAYS ingested/processed even when at capacity (oldest auto-dropped by deque).
 """
 
 from collections import deque
@@ -153,6 +155,7 @@ def add_market_data(symbol: str, data: dict) -> None:
     symbol = _resolve_buffer_key(symbol)
 
     if symbol not in LIVE_BARS:
+        # maxlen = 1441 to hold 1440 (1 day) + 1 forming minute. New data always appends (drops oldest if full).
         LIVE_BARS[symbol] = deque(maxlen=MAX_COMPLETED_BARS + 1)
 
     TICK_STATS[symbol] = TICK_STATS.get(symbol, 0) + 1
@@ -342,9 +345,9 @@ def get_buffer_status(symbol: str) -> Dict[str, Any]:
     return {
         "symbol": symbol,
         "bars_in_buffer": count,
-        "effective_bars": count,
+        "effective_bars": min(count, MAX_COMPLETED_BARS + 1),
         "max_bars": MAX_COMPLETED_BARS,
-        "pct_full": round(count / MAX_COMPLETED_BARS * 100, 2) if MAX_COMPLETED_BARS > 0 else 0,
+        "pct_full": round(min(count, MAX_COMPLETED_BARS + 1) / (MAX_COMPLETED_BARS + 1) * 100, 2) if (MAX_COMPLETED_BARS + 1) > 0 else 0,
         "m5_bars_in_buffer": m5_count,
         "max_m5_bars": MAX_M5_BARS,
         "m5_pct_full": round(m5_count / MAX_M5_BARS * 100, 2) if MAX_M5_BARS > 0 else 0,
@@ -352,6 +355,7 @@ def get_buffer_status(symbol: str) -> Dict[str, Any]:
         "ticks_received": TICK_STATS.get(symbol, 0),
         "bars_completed": max(0, count - 1),
         "forming_bar": last,
+        "note": "bars_in_buffer can reach MAX+1 (1441) to include the current forming minute. New market bars are ALWAYS processed and appended (deque auto-drops oldest when full). This is a rolling 1-day window from live market data."
     }
 
 
