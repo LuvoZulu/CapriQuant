@@ -119,6 +119,9 @@ def normalize_symbol(symbol: str) -> str:
 def market_data(data: dict, background_tasks: BackgroundTasks):
     symbol = normalize_symbol(data.get("symbol", "UNKNOWN"))
     timeframe = data.get("timeframe", "M5").upper()
+    if timeframe == "TICK":
+        timeframe = "M1"
+    is_backfill = data.get("backfill") in (True, "true", 1, "1", "True")
     req_id = str(uuid.uuid4())[:8]
 
     # === Data Quality Gate (phase2) - reject poison early ===
@@ -172,6 +175,37 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
 
     # 1. Update live buffer immediately (this is the fresh data we will use for decisions)
     live_buffer.add_market_data(symbol, data)
+
+    # Historical catch-up: buffer + DB only — do not fire live trades on stale bars
+    if is_backfill:
+        def _persist_backfill():
+            from app.db import db_cursor
+            try:
+                with db_cursor() as (c, cur):
+                    ts_val = data.get("timestamp")
+                    if ts_val:
+                        cur.execute(
+                            """
+                            INSERT INTO market_data
+                            (symbol, timeframe, timestamp, open, high, low, close, tick_volume, spread)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                symbol, timeframe, ts_val,
+                                data.get("open"), data.get("high"), data.get("low"),
+                                data.get("close"), data.get("volume"), data.get("spread", 0),
+                            ),
+                        )
+                    c.commit()
+            except Exception as e:
+                logger.error(f"Background backfill DB insert failed for {symbol}: {e}")
+
+        background_tasks.add_task(_persist_backfill)
+        return {
+            "status": "backfill_stored",
+            "normalized_symbol": symbol,
+            "timeframe": timeframe,
+        }
 
     # 2. Try to compute real-time signal using recent live data (more aggressive for live path)
     # Prefer full MTF production path when buffers allow (best for system)
@@ -254,12 +288,18 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
         # Apply kill switch / system mode override (non-bypassable)
         signal_result = _apply_system_mode_to_signal(signal_result, symbol)
         response["signal"] = signal_result
+        _flatten_signal_for_ea(response, signal_result)
         # Pretty print the real-time signal we just computed from live data
         print(f"\n[REALTIME SIGNAL from POST] {symbol} {timeframe}", json.dumps(signal_result, indent=2, default=str))
         # Promote key risk fields to top-level response for EA convenience (in addition to inside signal)
         for k in ("risk_pct", "risk_streak", "risk_veto", "validated_stop", "system_mode", "action"):
             if k in signal_result:
                 response[k] = signal_result[k]
+        try:
+            from app.utils.signal_logger import log_signal
+            log_signal(signal_result, symbol=symbol, timeframe=timeframe)
+        except Exception:
+            pass
 
         # Post-entry management suggestions for any current opens on this symbol (best for the system)
         try:
@@ -682,6 +722,22 @@ def api_control(payload: dict):
         return {"status": "ok", "mode": new_mode}
     else:
         return {"status": "error", "message": "Unknown action. Use flatten_all, pause, resume, or set_mode + mode."}
+
+def _flatten_signal_for_ea(response: dict, signal_result: dict) -> None:
+    """
+    MT5 EA parses flat sig_* keys from POST /market-data responses.
+    The nested 'signal' object alone is not readable by the simple MQL5 JSON helpers.
+    """
+    if not isinstance(signal_result, dict):
+        return
+    response["sig_dir"] = signal_result.get("signal")
+    response["sig_confidence"] = signal_result.get("confidence")
+    response["sig_setup"] = signal_result.get("setup")
+    response["sig_rationale"] = signal_result.get("rationale")
+    response["sig_stop_suggestion"] = signal_result.get("stop_suggestion")
+    response["sig_tp1"] = signal_result.get("tp1")
+    response["sig_tp2"] = signal_result.get("tp2")
+
 
 def _apply_system_mode_to_signal(signal_dict: dict, symbol: str = "") -> dict:
     """If system not in trading mode, override signal to HOLD or special FLATTEN."""

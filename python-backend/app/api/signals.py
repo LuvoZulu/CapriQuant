@@ -229,7 +229,7 @@ def get_trading_signal(
 
     if engine in ("structure", "mtf", "structure_mtf"):
         try:
-            log_signal(result)
+            log_signal(result, symbol=normalized, timeframe=tf_upper)
         except Exception:
             pass
 

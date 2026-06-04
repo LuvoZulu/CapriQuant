@@ -197,19 +197,12 @@ def get_recent_loss_streak(symbol: str = None, lookback: int = 12) -> int:
     """Count consecutive recent losses (r_multiple < 0 or close_reason=='sl' or outcome loss-like).
     Scans from most recent closed trades backward until a non-loss.
     """
-    if cursor is None:
-        return 0
     try:
-        try:
-            conn.rollback()
-        except:
-            pass
         params = []
         sym_clause = ""
         if symbol:
             sym_clause = "AND symbol = %s"
             params = [symbol]
-        # Prefer closed trades that have outcome or close_reason
         q = f"""
             SELECT r_multiple, close_reason, outcome
             FROM executed_trades
@@ -218,9 +211,14 @@ def get_recent_loss_streak(symbol: str = None, lookback: int = 12) -> int:
             ORDER BY COALESCE(close_ts, ts) DESC
             LIMIT %s
         """
-        exec_params = params + [lookback] if params else [lookback]
-        cursor.execute(q, exec_params)
-        rows = cursor.fetchall()
+        exec_params = tuple(params + [lookback])
+        with db_cursor() as (conn, cur):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            cur.execute(q, exec_params)
+            rows = cur.fetchall()
         streak = 0
         for r in rows:
             rm = r[0] if r[0] is not None else 0.0
@@ -230,26 +228,16 @@ def get_recent_loss_streak(symbol: str = None, lookback: int = 12) -> int:
             if is_loss:
                 streak += 1
             else:
-                break  # first non-loss stops the consecutive count
+                break
         return streak
     except Exception as e:
         print(f"[DB] get_recent_loss_streak failed: {e}")
-        try:
-            conn.rollback()
-        except:
-            pass
         return 0
 
 
 def get_today_realized_r(symbol: str = None) -> float:
     """Sum of r_multiple for trades that closed today (for daily loss circuit proxy)."""
-    if cursor is None:
-        return 0.0
     try:
-        try:
-            conn.rollback()
-        except:
-            pass
         today = _date.today()
         params = [today]
         sym_clause = ""
@@ -263,13 +251,14 @@ def get_today_realized_r(symbol: str = None) -> float:
               AND (close_reason IS NOT NULL OR (outcome NOT IN ('open','') AND r_multiple IS NOT NULL))
               {sym_clause}
         """
-        cursor.execute(q, params)
-        row = cursor.fetchone()
+        with db_cursor() as (conn, cur):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            cur.execute(q, tuple(params))
+            row = cur.fetchone()
         return float(row[0] or 0.0) if row else 0.0
     except Exception as e:
         print(f"[DB] get_today_realized_r failed: {e}")
-        try:
-            conn.rollback()
-        except:
-            pass
         return 0.0
