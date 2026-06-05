@@ -5,6 +5,7 @@ pandas>=2.2
 numpy>=1.26
 python-dotenv>=1.0
 streamlit>=1.33
+plotly>=5.22
 requests>=2.31
 
 # Dev / Test
