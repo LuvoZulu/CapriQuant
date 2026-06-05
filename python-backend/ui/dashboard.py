@@ -361,6 +361,34 @@ with tab_risk:
     except:
         st.warning("Could not fetch alerts")
 
+    # === NEW: Prop Firm Challenge Tracker (makes this enterprise useful for prop traders) ===
+    st.markdown("---")
+    st.subheader("🏆 Prop Firm Challenge Tracker (Demo / Configurable)")
+    st.caption("Track your progress toward typical prop firm rules. Customize thresholds in code or extend to read from backend config.")
+
+    # Simulated / example values - in real use pull from /api/system-status or risk endpoints + live PnL
+    col_p1, col_p2, col_p3 = st.columns(3)
+    with col_p1:
+        daily_loss_pct = 2.3  # example: replace with real calc from today_r * risk
+        st.metric("Daily Loss Used", f"{daily_loss_pct:.1f}%", delta="-2.7% to limit")
+        st.progress(min(daily_loss_pct / 5.0, 1.0))  # assume 5% max daily
+        st.caption("Max Daily Loss: 5% (typical FTMO-style)")
+    with col_p2:
+        profit_target_pct = 7.8
+        st.metric("Profit Target", f"{profit_target_pct:.1f}%", delta="+2.2% to go")
+        st.progress(min(profit_target_pct / 10.0, 1.0))  # 10% target
+        st.caption("Profit Target: 10%")
+    with col_p3:
+        consistency = 68
+        st.metric("Consistency Score", f"{consistency}%")
+        st.progress(consistency / 100.0)
+        st.caption("Min 60% consistency rule (demo)")
+
+    if daily_loss_pct > 4.5:
+        st.error("⚠️ Approaching daily loss limit - consider pausing!")
+    elif profit_target_pct > 8:
+        st.success("🎉 On track for profit target!")
+
     st.markdown("---")
     st.subheader("Open Positions + Management Suggestions")
     open_df = fetch_open_trades()
