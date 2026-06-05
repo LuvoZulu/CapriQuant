@@ -163,6 +163,13 @@ def add_market_data(symbol: str, data: dict) -> None:
 
     buffer = LIVE_BARS[symbol]
 
+    # Ensure buffer uses current MAX (in case code/config changed without restart)
+    current_maxlen = MAX_COMPLETED_BARS + 1
+    if getattr(buffer, 'maxlen', None) != current_maxlen:
+        data_list = list(buffer)
+        buffer = deque(data_list[-current_maxlen:], maxlen=current_maxlen)
+        LIVE_BARS[symbol] = buffer
+
     ts_raw = data.get("timestamp")
     ts = to_naive_utc(ts_raw) if ts_raw is not None else datetime.utcnow()
 
