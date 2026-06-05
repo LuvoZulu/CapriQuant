@@ -19,6 +19,8 @@ from datetime import datetime
 
 from app.features.structure import compute_market_structure
 from app.engine.confluence import get_structure_signal
+from app.engine.multi_timeframe import combine_mtf_signals
+from app.live_data import resample_ohlcv
 from app.risk import RiskManager, RiskParams
 from app.config import get_settings
 
@@ -34,6 +36,7 @@ def run_backtest(
     spread_points: float = 0.30,      # round-turn spread cost in price units (XAU ~0.2-0.6, indices vary)
     commission_r_per_trade: float = 0.02,  # extra cost in R units (commissions/swaps/slippage proxy)
     use_risk_manager: bool = True,
+    use_mtf: bool = False,  # if True, simulate M1/M5/M15 and use combine_mtf_signals for better live parity
 ) -> Dict:
     """
     Honest walk-forward backtest using FULL production signal path + RiskManager + realistic costs.
@@ -76,6 +79,27 @@ def run_backtest(
         # FULL production signal (was: raw evaluate_setups + manual score filter)
         sig = get_structure_signal(ms, spread=spread_points)
 
+        if use_mtf:
+            # Simulate MTF using resampled from current window (approximates live MTF path for parity)
+            try:
+                df_m1 = window_df.copy()
+                df_m5 = resample_ohlcv(df_m1, minutes=5)
+                df_m15 = resample_ohlcv(df_m1, minutes=15)
+                if len(df_m5) > 1:
+                    df_m5 = df_m5.iloc[:-1].reset_index(drop=True)
+                if len(df_m15) > 1:
+                    df_m15 = df_m15.iloc[:-1].reset_index(drop=True)
+                ms_m1 = compute_market_structure(df_m1.tail(120), symbol=symbol, timeframe="M1", min_candles=8)
+                ms_m5 = compute_market_structure(df_m5.tail(60), symbol=symbol, timeframe="M5", min_candles=8) if len(df_m5) >= 3 else None
+                ms_m15 = compute_market_structure(df_m15.tail(30), symbol=symbol, timeframe="M15", min_candles=6) if len(df_m15) >= 2 else None
+                if ms_m5 is not None:
+                    sig_m1 = get_structure_signal(ms_m1, spread=spread_points) if ms_m1 else {"signal": "HOLD", "bias": "NEUTRAL"}
+                    sig_m5 = get_structure_signal(ms_m5, spread=spread_points)
+                    sig_m15 = get_structure_signal(ms_m15, spread=spread_points) if ms_m15 else {"signal": "HOLD", "bias": "NEUTRAL"}
+                    sig = combine_mtf_signals(sig_m1, sig_m5, sig_m15, symbol)
+            except Exception:
+                pass  # fall back to single tf sig
+
         direction = sig.get("signal")
         if direction not in ("BUY", "SELL"):
             continue
@@ -85,9 +109,11 @@ def run_backtest(
         if rm is not None:
             # update rm equity snapshot
             rm.p.account_equity = equity
+            s = get_settings()
+            proxy_pct = s.risk_daily_pnl_proxy_pct / 100.0
             allowed, veto, dyn_risk = rm.can_take_trade(
                 recent_loss_streak=current_streak,
-                today_pnl= (daily_r_this_day * (equity * 0.015) ),  # proxy
+                today_pnl= (daily_r_this_day * (equity * proxy_pct) ),
                 starting_equity_today=day_start_equity,
             )
             if not allowed:

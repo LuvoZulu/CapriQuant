@@ -60,6 +60,8 @@ def load_mt5_csv(filepath: str | Path, symbol: Optional[str] = None) -> pd.DataF
     keep_cols = ["timestamp", "open", "high", "low", "close", "volume"]
     available = [c for c in keep_cols if c in df.columns]
     df = df[available]
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
 
     # Infer symbol from filename if not provided
     if symbol is None:

@@ -23,6 +23,7 @@ sys.path.append(str(Path(__file__).parent))
 
 from utils.load_mt5_data import load_mt5_csv, load_all_testing_data
 from app.backtest.replay import run_backtest
+from app.config import get_settings
 
 
 def main():
@@ -69,12 +70,13 @@ def main():
         print(f"{'='*70}")
 
         try:
+            s = get_settings()
             result = run_backtest(
                 df,
                 symbol=symbol,
                 timeframe=tf,
-                starting_equity=200.0,
-                risk_per_trade=1.8,
+                starting_equity=s.risk_starting_equity,
+                risk_per_trade=s.risk_base_pct,
                 min_confluence_score=0.68,
                 spread_points=0.30,          # realistic round-turn cost
                 use_risk_manager=True,       # dynamic + hard circuits

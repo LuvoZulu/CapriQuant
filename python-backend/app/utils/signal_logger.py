@@ -13,7 +13,8 @@ from typing import Dict, Optional
 
 from app.utils.symbols import normalize_symbol
 
-LOG_DIR = Path("logs")
+# Module-relative to be cwd-independent (e.g. when launched via service, uvicorn from different dir)
+LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 SIGNAL_LOG = LOG_DIR / "signals.jsonl"
 

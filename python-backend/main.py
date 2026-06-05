@@ -9,84 +9,23 @@ from app.live_data import get_recent_df, live_buffer, add_market_data as update_
 from app.features.builder import compute_structure
 from app.engine.confluence import get_structure_signal, evaluate_setups
 from app.engine.multi_timeframe import get_mtf_structure_signal
-from app.utils.symbols import symbol_sql_match
+from app.utils.symbols import symbol_sql_match, normalize_symbol as _normalize_symbol
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
 from app.engine.management import compute_managements_for_all_opens, compute_management_for_open
 from app.config import get_settings
+from app.system_mode import (
+    get_system_mode,
+    set_system_mode,
+    _apply_system_mode_to_signal,
+    _flatten_signal_for_ea,
+    _compute_current_alerts,
+    record_quality_bad,
+    get_quality_issues,
+)
 
-# =============================================================================
-# KILL SWITCH / SYSTEM MODE (phase 2 P1)
-# Persisted to simple file for restart safety. Modes: "trading" (normal), "paused" (hold only), "flatten" (close everything + hold)
-# =============================================================================
-import os
-from pathlib import Path
 import uuid
-CONTROL_STATE_FILE = Path("logs/system_mode.json")
-CONTROL_STATE_FILE.parent.mkdir(exist_ok=True)
-
-SYSTEM_MODE = "trading"  # default
-
-# Simple recent ingest quality (last N bad per symbol) for /status
-_QUALITY_BAD = {}  # symbol -> list of (ts, reasons)
-_MAX_QUALITY_BAD = 5
-
-def _compute_current_alerts():
-    """Basic alerting based on current risk state + mode (phase rec)."""
-    alerts = []
-    mode = get_system_mode()
-    if mode != "trading":
-        alerts.append({"level": "critical", "type": "system_mode", "msg": f"System in {mode} mode - trading restricted"})
-
-    try:
-        streak = get_recent_loss_streak(None) or 0
-        today_r = get_today_realized_r(None) or 0.0
-        if streak >= 3:
-            alerts.append({"level": "warning", "type": "streak", "msg": f"Loss streak = {streak}"})
-        if today_r < -3.0:  # rough R threshold
-            alerts.append({"level": "warning", "type": "daily_loss", "msg": f"Today realized R ~ {today_r:.1f}"})
-    except:
-        pass
-
-    # quality issues
-    for s, bads in _QUALITY_BAD.items():
-        if len(bads) > 2:
-            alerts.append({"level": "info", "type": "data_quality", "msg": f"{s} has {len(bads)} recent bad ticks"})
-
-    return alerts
-
-def _load_system_mode():
-    global SYSTEM_MODE
-    try:
-        if CONTROL_STATE_FILE.exists():
-            with open(CONTROL_STATE_FILE) as f:
-                data = json.load(f)
-                m = data.get("mode", "trading")
-                if m in ("trading", "paused", "flatten"):
-                    SYSTEM_MODE = m
-    except Exception:
-        pass
-    return SYSTEM_MODE
-
-def _save_system_mode(mode: str):
-    global SYSTEM_MODE
-    if mode not in ("trading", "paused", "flatten"):
-        mode = "trading"
-    SYSTEM_MODE = mode
-    try:
-        with open(CONTROL_STATE_FILE, "w") as f:
-            json.dump({"mode": mode, "ts": datetime.utcnow().isoformat()}, f)
-    except Exception as e:
-        logger.error(f"Failed to persist system mode: {e}")
-    return SYSTEM_MODE
-
-_load_system_mode()  # init on startup
-
-def get_system_mode() -> str:
-    return SYSTEM_MODE
-
-def set_system_mode(mode: str) -> str:
-    return _save_system_mode(mode)
+# Note: system mode logic moved to app/system_mode.py (no circular imports, single source)
 
 app = FastAPI(title="CapriQuant", version="2.0")
 
@@ -101,18 +40,9 @@ def home():
     return {"status": "quant system live"}
 
 
+# Delegate to canonical implementation (single source of truth in app/utils/symbols.py)
 def normalize_symbol(symbol: str) -> str:
-    """Normalize broker symbol names (e.g. XAUUSDm, XAUUSD#, XAUUSD.pro → XAUUSD)"""
-    if not symbol:
-        return symbol
-    s = symbol.upper()
-    # Common suffixes brokers add
-    suffixes = ['M', '#', '.PRO', '.STD', '.ECN', '.RAW', 'PRO', 'STD']
-    for suf in suffixes:
-        if s.endswith(suf):
-            s = s[: -len(suf)]
-            break
-    return s
+    return _normalize_symbol(symbol)
 
 
 @app.post("/market-data")
@@ -161,12 +91,8 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
             logger.warning(f"[DATA_QUALITY] {symbol} rejected: {bad_reasons} raw={data}")
             # Still allow buffer for resilience in early dev, but mark & don't compute signal on bad
             data["_quality_bad"] = bad_reasons
-            # record for status
-            if symbol not in _QUALITY_BAD:
-                _QUALITY_BAD[symbol] = []
-            _QUALITY_BAD[symbol].append((datetime.utcnow().isoformat(), bad_reasons))
-            if len(_QUALITY_BAD[symbol]) > _MAX_QUALITY_BAD:
-                _QUALITY_BAD[symbol] = _QUALITY_BAD[symbol][- _MAX_QUALITY_BAD :]
+            # record for status (delegated to shared module)
+            record_quality_bad(symbol, bad_reasons)
     except Exception as _qe:
         logger.debug(f"quality gate error (non fatal): {_qe}")
 
@@ -249,9 +175,9 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
                 # Account-level (global) streak + daily PnL for hard circuits — not per-symbol
                 streak = get_recent_loss_streak(None) or 0
                 today_r = get_today_realized_r(None) or 0.0
-                avg_risk_money = eq * 0.015
-                today_pnl = today_r * avg_risk_money
                 s = get_settings()
+                avg_risk_money = eq * (s.risk_daily_pnl_proxy_pct / 100.0)
+                today_pnl = today_r * avg_risk_money
                 params = RiskParams(
                     account_equity=eq,
                     starting_equity=s.risk_starting_equity,
@@ -541,7 +467,7 @@ def api_system_status():
         "catchup_max_m1_bars": get_settings().catchup_max_m1_bars,
         "symbols_tracked": syms,
         "buffers": buffers,
-        "recent_data_quality_issues": {s: _QUALITY_BAD.get(s, []) for s in syms},
+        "recent_data_quality_issues": {s: get_quality_issues().get(s, []) for s in syms},
         "alerts": _compute_current_alerts(),
     }
 
@@ -560,7 +486,7 @@ def metrics():
     except:
         pass
     # quality issues count
-    for s, bads in list(_QUALITY_BAD.items())[:10]:
+    for s, bads in list(get_quality_issues().items())[:10]:
         lines.append(f'capri_data_quality_bad_count{{symbol="{s}"}} {len(bads)}')
     # simple health
     lines.append(f'capri_up 1')
@@ -745,44 +671,5 @@ def api_control(payload: dict):
     else:
         return {"status": "error", "message": "Unknown action. Use flatten_all, pause, resume, or set_mode + mode."}
 
-def _flatten_signal_for_ea(response: dict, signal_result: dict) -> None:
-    """
-    MT5 EA parses flat sig_* keys from POST /market-data responses.
-    The nested 'signal' object alone is not readable by the simple MQL5 JSON helpers.
-    """
-    if not isinstance(signal_result, dict):
-        return
-    response["sig_dir"] = signal_result.get("signal")
-    response["sig_confidence"] = signal_result.get("confidence")
-    response["sig_setup"] = signal_result.get("setup")
-    response["sig_rationale"] = signal_result.get("rationale")
-    stop = signal_result.get("validated_stop") or signal_result.get("stop_suggestion")
-    response["sig_stop_suggestion"] = stop
-    response["sig_tp1"] = signal_result.get("tp1")
-    response["sig_tp2"] = signal_result.get("tp2")
-    mgmt = signal_result.get("management")
-    if isinstance(mgmt, dict):
-        response["management_action"] = mgmt.get("action")
-        response["management_new_sl"] = mgmt.get("new_sl")
-        response["management_reason"] = mgmt.get("reason")
-
-
-def _apply_system_mode_to_signal(signal_dict: dict, symbol: str = "") -> dict:
-    """If system not in trading mode, override signal to HOLD or special FLATTEN."""
-    mode = get_system_mode()
-    if mode == "trading":
-        return signal_dict
-    out = dict(signal_dict) if isinstance(signal_dict, dict) else {"signal": "HOLD"}
-    if mode == "flatten":
-        out["signal"] = "FLATTEN"
-        out["rationale"] = (out.get("rationale", "") + " | SYSTEM FLATTEN: close all positions immediately.").strip()
-        out["action"] = "flatten_all"
-    else:  # paused
-        out["signal"] = "HOLD"
-        out["rationale"] = (out.get("rationale", "") + " | SYSTEM PAUSED via kill switch / control.").strip()
-    out["system_mode"] = mode
-    logger.warning(f"[SYSTEM MODE] {symbol} overridden to {out['signal']} (mode={mode})")
-    return out
-
-# Enhance existing system-status with mode
-# (we'll monkey a bit at end of function by editing the return in place if needed; for now new calls will see it)
+# System mode helpers now live in app/system_mode.py (imported above).
+# This eliminates duplication and the previous circular import hacks.

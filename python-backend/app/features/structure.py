@@ -92,6 +92,7 @@ class FairValueGap:
 
 
 @dataclass
+@dataclass
 class SessionRange:
     phase: SessionPhase
     asian_high: Optional[float] = None
@@ -464,7 +465,7 @@ def identify_order_blocks(
 
             obs.append(OrderBlock(
                 idx=i-1,
-                timestamp=pd.to_datetime(ob_candle.name) if hasattr(ob_candle, 'name') else df.index[i-1],
+                timestamp=df["timestamp"].iloc[i-1],
                 ob_type="BULLISH",
                 high=float(ob_high),
                 low=float(ob_low),
@@ -495,7 +496,7 @@ def identify_order_blocks(
 
             obs.append(OrderBlock(
                 idx=i-1,
-                timestamp=pd.to_datetime(ob_candle.name) if hasattr(ob_candle, 'name') else df.index[i-1],
+                timestamp=df["timestamp"].iloc[i-1],
                 ob_type="BEARISH",
                 high=float(ob_high),
                 low=float(ob_low),

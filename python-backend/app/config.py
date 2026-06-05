@@ -25,6 +25,8 @@ class Settings:
     risk_conservative_pct: float = 0.7
     risk_starting_equity: float = 200.0
     risk_target_equity: float = 17000.0
+    # Proxy used to convert R-multiples to $ PnL for daily/streak circuit (approx avg risk per trade)
+    risk_daily_pnl_proxy_pct: float = 1.5
 
     # Confluence / signal
     min_confluence_for_setup: float = 0.48
@@ -68,6 +70,7 @@ class Settings:
         self.management_enabled = os.getenv("CAPRI_MANAGEMENT_ENABLED", "true").lower() == "true"
         self.catchup_max_hours = float(os.getenv("CAPRI_CATCHUP_MAX_HOURS", self.catchup_max_hours))
         self.catchup_max_m1_bars = int(os.getenv("CAPRI_CATCHUP_MAX_M1_BARS", self.catchup_max_m1_bars))
+        self.risk_daily_pnl_proxy_pct = float(os.getenv("CAPRI_RISK_DAILY_PROXY_PCT", self.risk_daily_pnl_proxy_pct))
         # Enforce strict 1-day limit for rollback/trend checks after downtime (user requirement: no going far back)
         if self.catchup_max_hours > 24.0:
             self.catchup_max_hours = 24.0

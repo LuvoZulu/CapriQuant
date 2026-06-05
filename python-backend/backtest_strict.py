@@ -22,11 +22,12 @@ sys.path.append(str(Path(__file__).parent))
 
 from utils.load_mt5_data import load_mt5_csv
 from app.backtest.replay import run_backtest
+from app.config import get_settings
 
 
 def run_strict_backtest(symbol: str, timeframe: str, df: pd.DataFrame,
-                        starting_equity: float = 200.0,
-                        risk_per_trade: float = 1.8,
+                        starting_equity: float = None,
+                        risk_per_trade: float = None,
                         min_confluence: float = 0.72,
                         print_trades: bool = True):
     """
@@ -38,6 +39,11 @@ def run_strict_backtest(symbol: str, timeframe: str, df: pd.DataFrame,
     print(f"Min Confluence Threshold: {min_confluence}")
     print(f"{'='*80}")
 
+    s = get_settings()
+    if starting_equity is None:
+        starting_equity = s.risk_starting_equity
+    if risk_per_trade is None:
+        risk_per_trade = s.risk_base_pct
     result = run_backtest(
         df,
         symbol=symbol,
@@ -120,7 +126,7 @@ def main():
             symbol=symbol,
             timeframe=tf,
             df=df,
-            starting_equity=200.0,
+            starting_equity=None,
             risk_per_trade=1.8,
             min_confluence=min_conf,
             print_trades=True

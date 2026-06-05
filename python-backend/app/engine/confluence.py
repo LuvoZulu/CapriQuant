@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from app.features.structure import MarketStructure, OrderBlock
 
 # Import the fully rewritten contextual analyzers
-from app.strategies import amd, fibonacci, price_action, liquidity, crt
+from app.strategies import amd, fibonacci, price_action, liquidity, crt, structure as struc_mod
 from app.config import get_settings
 
 
@@ -203,15 +203,16 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
     pa_score = price_action.analyze_price_action_contextual(ms)
     liq_score = liquidity.analyze_liquidity_sweeps(ms)
     crt_score = crt.analyze_crt_range_confluence(
-        df=ms.df if hasattr(ms, "df") else None,
+        df=None,
         market_structure=ms,
-        recent_displacement=getattr(ms, "atr", 0) * 1.5,  # rough
+        recent_displacement=getattr(ms, "recent_displacement", None),
         bias=getattr(ms, "bias", "NEUTRAL"),
         atr=getattr(ms, "atr", 0),
     )
+    struc_score = struc_mod.analyze_structure(ms) if hasattr(struc_mod, 'analyze_structure') else 0.0
 
     s = get_settings()
-    total_confluence = amd_score + fib_score + pa_score + liq_score + (crt_score * 0.6)
+    total_confluence = amd_score + fib_score + pa_score + liq_score + (crt_score * 0.6) + (struc_score * 0.4)
 
     # Global quality gate from config
     if total_confluence < s.min_confluence_for_setup:
@@ -485,13 +486,14 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
     pa_score = price_action.analyze_price_action_contextual(ms)
     liq_score = liquidity.analyze_liquidity_sweeps(ms)
     crt_score = crt.analyze_crt_range_confluence(
-        df=ms.df if hasattr(ms, "df") else None,
+        df=None,
         market_structure=ms,
-        recent_displacement=getattr(ms, "atr", 0) * 1.5,
+        recent_displacement=getattr(ms, "recent_displacement", None),
         bias=getattr(ms, "bias", "NEUTRAL"),
         atr=getattr(ms, "atr", 0),
     )
-    total_confluence = amd_score + fib_score + pa_score + liq_score + (crt_score * 0.6)
+    struc_score = struc_mod.analyze_structure(ms) if hasattr(struc_mod, 'analyze_structure') else 0.0
+    total_confluence = amd_score + fib_score + pa_score + liq_score + (crt_score * 0.6) + (struc_score * 0.4)
 
     result = {
         "signal": best.direction,
@@ -514,6 +516,7 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
             "price_action": round(pa_score, 3),
             "liquidity": round(liq_score, 3),
             "crt": round(crt_score, 3),
+            "structure": round(struc_score, 3),
             "total": round(total_confluence, 3),
         },
         "market_structure": ms.to_dict(),

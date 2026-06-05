@@ -21,7 +21,6 @@ from app.live_data import live_buffer, resample_ohlcv, filter_df_to_catchup_wind
 from app.config import get_settings
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
-from app.config import get_settings
 
 # Minimum confidence (0-100) to emit BUY/SELL after MTF alignment
 _s = get_settings()
@@ -243,9 +242,15 @@ def get_mtf_structure_signal(
             eq = float(equity) if equity and equity > 1.0 else 200.0
             streak = get_recent_loss_streak(None) or 0
             today_r = get_today_realized_r(None) or 0.0
-            avg_risk_money = eq * 0.015
+            s = get_settings()
+            avg_risk_money = eq * (s.risk_daily_pnl_proxy_pct / 100.0)
             today_pnl = today_r * avg_risk_money
-            params = RiskParams(account_equity=eq, starting_equity=200.0, target_equity=17000.0)
+            params = RiskParams(
+                account_equity=eq,
+                starting_equity=s.risk_starting_equity,
+                target_equity=s.risk_target_equity,
+                max_daily_loss_pct=s.risk_max_daily_loss_pct,
+            )
             rm = RiskManager(params)
             allowed, veto_reason, eff_risk = rm.can_take_trade(
                 recent_loss_streak=streak, today_pnl=today_pnl, starting_equity_today=eq

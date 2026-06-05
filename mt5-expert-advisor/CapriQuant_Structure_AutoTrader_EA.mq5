@@ -7,6 +7,10 @@
 //|  - Automatically executes trades using structural levels         |
 //|  - Uses stop_suggestion, tp1, tp2 returned by the backend        |
 //+------------------------------------------------------------------+
+// CANONICAL LIVE SOURCE: Prefer this file (or Realtime variant) for
+// production. Other .mq5 in this folder and pb/ are divergent copies.
+// Keep in sync when editing signal handling / risk / management.
+//+------------------------------------------------------------------+
 #property copyright "CapriQuant 2026"
 #property version   "5.0"
 #property strict

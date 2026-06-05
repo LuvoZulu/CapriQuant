@@ -24,6 +24,7 @@ sys.path.append(str(Path(__file__).parent))
 
 from utils.load_mt5_data import load_mt5_csv
 from app.backtest.replay import run_backtest
+from app.config import get_settings
 from app.features.structure import compute_market_structure
 
 
@@ -71,12 +72,13 @@ def run_gold_backtest(timeframe: str, min_confluence: float = 0.72, use_htf_bias
             print(f"HTF (M15) Bias detected: {htf_bias}")
 
     # Run the backtest
+    s = get_settings()
     result = run_backtest(
         df,
         symbol="XAUUSD",
         timeframe=timeframe,
-        starting_equity=200.0,
-        risk_per_trade=1.8,
+        starting_equity=s.risk_starting_equity,
+        risk_per_trade=s.risk_base_pct,
         min_confluence_score=min_confluence,
         step=6,
     )

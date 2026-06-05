@@ -9,23 +9,10 @@ from app.utils.signal_logger import log_signal
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
 from app.config import get_settings
+from app.utils.symbols import normalize_symbol as _normalize_symbol
 
-# For kill switch / system mode (shared with main)
-# NOTE: lazy import inside funcs to avoid fragile top-level cross import (main <-> app.api.signals)
-# which could cause dummy always-trading funcs and kill/pause ignored on /signal poll path from EA.
-def get_system_mode():
-    try:
-        from main import get_system_mode as _gm
-        return _gm()
-    except Exception:
-        return "trading"
-
-def _apply_system_mode_to_signal(d, s=""):
-    try:
-        from main import _apply_system_mode_to_signal as _ap
-        return _ap(d, s)
-    except Exception:
-        return d
+# System mode (kill switch) from shared module (no circular hacks)
+from app.system_mode import get_system_mode, _apply_system_mode_to_signal
 
 router = APIRouter()
 
@@ -49,17 +36,9 @@ def _resolve_validated_stop(signal: dict) -> float | None:
 MIN_CANDLES_FOR_SIGNAL = 50  # You can lower this for testing if needed
 
 
+# Use canonical normalizer (and re-export for any local consumers)
 def normalize_symbol(symbol: str) -> str:
-    """Normalize broker symbol names (e.g. XAUUSDm, XAUUSD#, XAUUSD.pro → XAUUSD)"""
-    if not symbol:
-        return symbol
-    s = symbol.upper()
-    suffixes = ['M', '#', '.PRO', '.STD', '.ECN', '.RAW', 'PRO', 'STD']
-    for suf in suffixes:
-        if s.endswith(suf):
-            s = s[: -len(suf)]
-            break
-    return s
+    return _normalize_symbol(symbol)
 
 
 def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min_candles_override: int = None) -> pd.DataFrame:
@@ -268,10 +247,9 @@ def get_trading_signal(
             # Account-level risk (streak + daily loss circuits protect the whole account, not per-symbol)
             streak = get_recent_loss_streak(None) or 0
             today_r = get_today_realized_r(None) or 0.0
-            # today_pnl proxy: realized r * rough risk amount (use 1.5% of current eq as avg)
-            avg_risk_money = eq * 0.015
-            today_pnl = today_r * avg_risk_money
             s = get_settings()
+            avg_risk_money = eq * (s.risk_daily_pnl_proxy_pct / 100.0)
+            today_pnl = today_r * avg_risk_money
             params = RiskParams(
                 account_equity=eq,
                 starting_equity=s.risk_starting_equity,
