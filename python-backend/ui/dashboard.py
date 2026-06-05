@@ -23,6 +23,17 @@ from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
 
+st.set_page_config(
+    page_title="CapriQuant Enterprise • Live Ops Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://github.com/LuvoZulu/CapriQuant',
+        'Report a bug': "mailto:support@capriquant.example",
+        'About': "# CapriQuant Enterprise Trading Platform\nProfessional SMC Structure Engine for Prop Capital"
+    }
+)
+
 # Enterprise styling - professional dark trading theme (similar to Bloomberg / TradingView)
 CUSTOM_CSS = """
 <style>
@@ -107,16 +118,65 @@ SYMBOLS = ["US30", "USTEC", "DE30", "XAUUSD"]  # extend as you add more
 # Or double-click: python-backend/ui/run_ui.bat
 # (Streamlit UI itself can run on any port - default is 8501. It fetches data from the backend on 8001)
 
-st.set_page_config(
-    page_title="CapriQuant Enterprise • Live Ops Dashboard",
-    layout="wide",
-    initial_sidebar_state="expanded",
-    menu_items={
-        'Get Help': 'https://github.com/LuvoZulu/CapriQuant',
-        'Report a bug': "mailto:support@capriquant.example",
-        'About': "# CapriQuant Enterprise Trading Platform\nProfessional SMC Structure Engine for Prop Capital"
-    }
-)
+# =============================================================================
+# BACKEND HELPER FUNCTIONS
+# =============================================================================
+
+def fetch_json(path: str) -> dict:
+    """Generic GET → dict. Returns {} on any network or parse error."""
+    try:
+        r = requests.get(f"{BACKEND}{path}", timeout=3)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return {}
+
+
+def fetch_status() -> dict:
+    """Fetch backend system status from /api/system-status."""
+    return fetch_json("/api/system-status")
+
+
+def fetch_current(symbol: str) -> dict:
+    """Fetch the current structure snapshot for a single symbol."""
+    return fetch_json(f"/api/current-structure/{symbol}")
+
+
+def fetch_recent_signals(symbol=None, limit: int = 100) -> pd.DataFrame:
+    """Fetch recent signals, optionally filtered by symbol."""
+    try:
+        params = {"limit": limit}
+        if symbol:
+            params["symbol"] = symbol
+        r = requests.get(f"{BACKEND}/api/recent-signals", params=params, timeout=3)
+        r.raise_for_status()
+        data = r.json()
+        rows = data if isinstance(data, list) else data.get("signals", [])
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_open_trades() -> pd.DataFrame:
+    """Fetch currently open trades from /api/open-trades."""
+    try:
+        data = fetch_json("/api/open-trades")
+        rows = data if isinstance(data, list) else data.get("trades", [])
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_trades(limit: int = 100) -> pd.DataFrame:
+    """Fetch closed trade history from /api/trades."""
+    try:
+        r = requests.get(f"{BACKEND}/api/trades", params={"limit": limit}, timeout=3)
+        r.raise_for_status()
+        data = r.json()
+        rows = data if isinstance(data, list) else data.get("trades", [])
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 # Enterprise header
 st.markdown("""
