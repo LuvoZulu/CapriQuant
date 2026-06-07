@@ -126,6 +126,84 @@ def get_data_count(symbol: str = None, timeframe: str = None):
         return {"error": str(e)}
 
 
+@router.get("/api/current-structure/{symbol}")
+def get_current_structure(symbol: str):
+    """
+    Snapshot for UI Live Overview symbol cards.
+    Returns live buffer counts (M1 + derived M5) + key structure fields so the
+    dashboard can render updating M1/M5 candle progress bars, readiness, bias, OBs, swings.
+    This was missing, causing UI candle counts to stay at 0 / 'insufficient'.
+    """
+    normalized = normalize_symbol(symbol)
+    try:
+        from app.live_data import get_buffer_status, get_latest_price
+        buf = get_buffer_status(normalized)
+        live_p = get_latest_price(normalized)
+        current_price = live_p.get("close") if live_p else None
+    except Exception as e:
+        buf = {"bars_in_buffer": 0, "m5_bars_in_buffer": 0, "pct_full": 0, "m5_pct_full": 0}
+        current_price = None
+
+    # Attempt a lightweight MTF snapshot for bias/summary/obs counts (non-fatal)
+    bias = "NEUTRAL"
+    summary = "Awaiting live bars..."
+    bull_obs = 0
+    bear_obs = 0
+    swings = 0
+    try:
+        from app.engine.multi_timeframe import get_mtf_structure_signal
+        res = get_mtf_structure_signal(
+            normalized, spread=0.0, min_candles_m1=5, equity=0.0
+        ) or {}
+        if isinstance(res, dict):
+            bias = res.get("bias") or bias
+            summary = res.get("structure_summary") or res.get("rationale") or summary
+            ms = res.get("market_structure") or {}
+            bull_obs = ms.get("active_bullish_obs", res.get("active_bullish_obs", 0)) or 0
+            bear_obs = ms.get("active_bearish_obs", res.get("active_bearish_obs", 0)) or 0
+            swings = ms.get("swing_count", res.get("swing_count", 0)) or 0
+            if current_price is None:
+                current_price = res.get("current_price")
+    except Exception:
+        # Fall back to buffer-driven status only; UI will still show correct M1/M5 counts
+        if buf.get("m5_bars_in_buffer", 0) >= 8:
+            summary = "Live M5 context building"
+        elif buf.get("bars_in_buffer", 0) >= 5:
+            summary = "Collecting M1 bars for M5 resample"
+
+    status = "ok"
+    if buf.get("bars_in_buffer", 0) < 5:
+        status = "insufficient_live_data"
+
+    return {
+        "symbol": normalized,
+        "buffer": buf,
+        "current_price": current_price,
+        "bias": bias,
+        "structure_summary": summary,
+        "active_bullish_obs": bull_obs,
+        "active_bearish_obs": bear_obs,
+        "swing_count": swings,
+        "status": status,
+    }
+
+
+@router.get("/debug/live-buffer")
+def debug_live_buffer():
+    """Debug endpoint used by dashboard 'Live Buffer Health' section."""
+    try:
+        from app.live_data import list_tracked_symbols, get_all_buffer_lengths, get_buffer_status
+        tracked = list_tracked_symbols()
+        return {
+            "tracked": tracked,
+            "lengths": get_all_buffer_lengths(),
+            "per_symbol": {s: get_buffer_status(s) for s in tracked},
+            "source": "live_market_buffer",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @router.get("/signal/{symbol}/{timeframe}")
 def get_trading_signal(
     symbol: str,

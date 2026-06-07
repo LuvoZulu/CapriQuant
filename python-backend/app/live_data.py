@@ -496,6 +496,11 @@ class _LiveBufferCompat:
     def get_recent_df_for_structure(self, symbol: str, limit: Optional[int] = None):
         return get_recent_df_for_structure(symbol, limit)
 
+    def __call__(self, symbol: str, timeframe: Optional[str] = None):
+        """Compat for legacy call sites: live_buffer(symbol, "M1") -> raw deque (or None)."""
+        key = _resolve_buffer_key(symbol)
+        return LIVE_BARS.get(key)
+
     def forming(self):
         return {}
 

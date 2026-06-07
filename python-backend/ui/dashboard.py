@@ -44,12 +44,11 @@ st.set_page_config(
 )
 
 # ─── Google Fonts ─────────────────────────────────────────────────────────────
-st.markdown(
+st.html(
     """
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
-""",
-    unsafe_allow_html=True,
+"""
 )
 
 # ─── CSS ──────────────────────────────────────────────────────────────────────
@@ -465,7 +464,7 @@ hr { border-color: var(--border-dim) !important; }
 }
 </style>
 """
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+st.html(CUSTOM_CSS)
 
 # =============================================================================
 # CONFIG
@@ -634,7 +633,7 @@ conn_label = "CONNECTED"                       if backend_alive else "DISCONNECT
 # =============================================================================
 # HEADER
 # =============================================================================
-st.markdown(f"""
+st.html(f"""
 <div class="cq-header">
   <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px;">
 
@@ -644,7 +643,6 @@ st.markdown(f"""
     </div>
 
     <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
-      <!-- Clock -->
       <div style="text-align:right;">
         <div style="font-family:var(--font-mono); font-size:1.05rem; color:var(--text-hi); letter-spacing:0.05em;">
           {utc_now.strftime('%H:%M:%S')}&nbsp;<span style="color:var(--text-lo); font-size:0.68rem;">UTC</span>
@@ -654,15 +652,12 @@ st.markdown(f"""
         </div>
       </div>
 
-      <!-- Session badge -->
       <span class="cq-session" style="background:{sess_bg}; color:{sess_color}; border:1px solid {sess_color}55;">
         {session_name}
       </span>
 
-      <!-- System mode -->
       <span class="cq-badge {mode_badge_cls}">{mode_label}</span>
 
-      <!-- Connection -->
       <div style="display:flex; align-items:center; gap:7px;">
         {conn_dot}
         <span style="font-family:var(--font-mono); font-size:0.62rem; color:{conn_color};">{conn_label}</span>
@@ -671,14 +666,14 @@ st.markdown(f"""
 
   </div>
 </div>
-""", unsafe_allow_html=True)
+""")
 
 # =============================================================================
 # KILL SWITCH BAR  (always visible, non-bypassable — preserved from original)
 # =============================================================================
-st.markdown("""
+st.html("""
 <div class="cq-ks-bar">
-  <span style="font-family:var(--font-ui); font-size:0.65rem; font-weight:800;
+  <span style="font-family:var(--font-mono); font-size:0.65rem; font-weight:800;
                letter-spacing:0.12em; text-transform:uppercase; color:var(--red);">
     🛡&nbsp; SYSTEM CONTROL &nbsp;·&nbsp; NON-BYPASSABLE &nbsp;·&nbsp; AFFECTS ALL CONNECTED EAs
   </span>
@@ -686,7 +681,7 @@ st.markdown("""
     POST /api/control
   </span>
 </div>
-""", unsafe_allow_html=True)
+""")
 
 ks1, ks2, ks3, ks4 = st.columns([2.2, 1.5, 1.5, 0.8])
 
@@ -739,12 +734,12 @@ except Exception:
 # SIDEBAR
 # =============================================================================
 with st.sidebar:
-    st.markdown("""
+    st.html("""
     <div style="padding:8px 0 14px;">
       <span style="font-family:var(--font-mono); font-size:0.85rem; font-weight:600;
                    color:var(--accent); letter-spacing:0.12em;">CQ CONTROLS</span>
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
     # Dashboard controls
     st.markdown('<div class="cq-section">Dashboard</div>', unsafe_allow_html=True)
@@ -779,7 +774,7 @@ with st.sidebar:
     halted_str   = "YES ⚠️" if is_halted else "NO"
     halted_color = "var(--red)" if is_halted else "var(--green)"
 
-    st.markdown(f"""
+    st.html(f"""
     <div class="cq-card" style="padding:10px 12px;">
       <div class="stat-row">
         <span class="stat-lbl">Equity</span>
@@ -802,7 +797,7 @@ with st.sidebar:
         <span class="stat-val" style="color:{'var(--red)' if bad_ticks > 0 else 'var(--text-lo)'};">{bad_ticks}</span>
       </div>
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
     st.markdown('<div class="cq-section">Signal Engine</div>', unsafe_allow_html=True)
 
@@ -812,7 +807,7 @@ with st.sidebar:
     hold_n = signals_total.get("HOLD", 0)
     directional_pct = (buy_n + sell_n) / total_sigs * 100
 
-    st.markdown(f"""
+    st.html(f"""
     <div class="cq-card" style="padding:10px 12px;">
       <div class="stat-row">
         <span class="stat-lbl">BUY</span>
@@ -835,10 +830,10 @@ with st.sidebar:
         <span class="stat-val">{directional_pct:.0f}%</span>
       </div>
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
     st.markdown("---")
-    st.markdown(f"""
+    st.html(f"""
     <div style="font-family:var(--font-mono); font-size:0.58rem; color:var(--text-lo); line-height:1.8;">
       Backend: {BACKEND}<br>
       Session: {session_name}<br>
@@ -846,7 +841,7 @@ with st.sidebar:
       Risk layers: hard + non-bypassable<br>
       Data: direct market buffer (15840 M1)
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
 
 # =============================================================================
@@ -922,7 +917,7 @@ with tab_overview:
             else:
                 b_color = "var(--yellow)"
 
-            st.markdown(f"""
+            st.html(f"""
             <div class="sym-card">
               <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                 <span class="sym-label">{sym}</span>
@@ -932,7 +927,7 @@ with tab_overview:
               <div class="sym-price">{f'{price:.2f}' if price else '— —'}</div>
               <div class="sym-summary">{snap.get('structure_summary', 'Awaiting data...') if not insufficient else 'Insufficient live data'}</div>
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
             if not insufficient:
                 ob1, ob2, ob3 = st.columns(3)
@@ -1317,7 +1312,7 @@ with tab_lifecycle:
             rr_color  = "var(--green)" if rr >= 1.0 else ("var(--yellow)" if rr >= 0 else "var(--red)")
             be_html   = '<span class="be-pill">BE</span>' if is_be else ""
 
-            st.markdown(f"""
+            st.html(f"""
             <div class="lc-card">
               <div>
                 <span class="lc-id">{t.get('trade_id', 'N/A')}</span>
@@ -1341,7 +1336,7 @@ with tab_lifecycle:
                 <div class="lc-rr" style="color:{rr_color};">{rr:.2f}R</div>
               </div>
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
         # Mini chart — R:R distribution of open trades
         if len(active_trades) >= 2:

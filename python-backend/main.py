@@ -122,6 +122,13 @@ def control(body: dict) -> Dict:
 def system_status() -> Dict:
     """Full status snapshot for dashboard and monitoring."""
     rm = get_risk_manager()
+    try:
+        from app.live_data import list_tracked_symbols, get_all_buffer_lengths
+        tracked = list_tracked_symbols()
+        lengths = get_all_buffer_lengths()
+    except Exception:
+        tracked = []
+        lengths = {}
     return {
         "system_mode": get_system_mode(),
         "risk": rm.get_state_dict(),
@@ -132,6 +139,9 @@ def system_status() -> Dict:
             "risk_vetoes_total": _metrics["risk_vetoes_total"],
             "bad_ticks_total": _metrics["bad_ticks_total"],
         },
+        "symbols_tracked": tracked,
+        "buffer_max_m1": 15840,
+        "live_buffer_lengths": lengths,
     }
 
 
@@ -254,7 +264,7 @@ def market_data(data: dict, background_tasks: BackgroundTasks) -> Dict:  # noqa:
             return {"status": "backfill_skipped", "symbol": symbol}
 
     # ── Update live buffer ───────────────────────────────────────────────
-    update_live_bar(symbol, timeframe, data)
+    update_live_bar(symbol, data)
 
     # ── Update equity in RiskManager if EA sends it ─────────────────────
     equity = data.get("equity") or data.get("account_equity")
