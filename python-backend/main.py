@@ -13,6 +13,7 @@ from app.utils.symbols import symbol_sql_match, normalize_symbol as _normalize_s
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
 from app.engine.management import compute_managements_for_all_opens, compute_management_for_open
+from app.features.trade_lifecycle import TradeLifecycleManager, ActiveTrade
 from app.config import get_settings
 from app.system_mode import (
     get_system_mode,
@@ -34,16 +35,86 @@ app.include_router(signal_router)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── TradeLifecycleManager singleton (survives across requests) ──────────
+# Register trades on entry; call on_bar() each tick for management actions.
+_lifecycle_manager = TradeLifecycleManager()
 
 @app.get("/")
 def home():
     return {"status": "quant system live"}
 
+@app.post("/lifecycle/register")
+def lifecycle_register(trade: dict):
+    """
+    Register an open trade with the lifecycle manager.
+    Call this from the EA immediately after a fill is confirmed.
+
+    Required fields in body:
+        trade_id, symbol, direction ('long'|'short'),
+        entry_price, initial_stop, initial_tp,
+        lot_size, risk_pct
+
+    The lifecycle manager will then emit BE/trail/exit actions
+    on subsequent /market-data ticks via the lifecycle_actions field.
+    """
+    try:
+        from app.features.trade_lifecycle import ActiveTrade
+        from datetime import datetime
+        t = ActiveTrade(
+            trade_id=str(trade.get("trade_id") or trade.get("ticket") or "unknown"),
+            symbol=normalize_symbol(str(trade.get("symbol", "UNKNOWN"))),
+            direction=str(trade.get("direction", "long")).lower(),
+            entry_price=float(trade["entry_price"]),
+            initial_stop=float(trade["initial_stop"]),
+            initial_tp=float(trade.get("initial_tp") or trade.get("tp1", 0)),
+            entry_time=datetime.utcnow(),
+            lot_size=float(trade.get("lot_size") or trade.get("volume_lots", 0.01)),
+            risk_pct=float(trade.get("risk_pct", 1.0)),
+        )
+        _lifecycle_manager.register_trade(t)
+        logger.info("[Lifecycle] Registered trade %s (%s %s @ %.5f SL=%.5f)",
+                    t.trade_id, t.direction.upper(), t.symbol,
+                    t.entry_price, t.initial_stop)
+        return {"status": "registered", "trade_id": t.trade_id}
+    except Exception as e:
+        logger.error("[Lifecycle] register failed: %s", e)
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/lifecycle/close")
+def lifecycle_close(data: dict):
+    """
+    Notify the lifecycle manager that a trade has closed.
+    Call from the EA after SL/TP/manual close is confirmed.
+
+    Required: trade_id, close_price, close_reason ('sl'|'tp'|'be'|'choch_exit'|'manual')
+    """
+    trade_id = str(data.get("trade_id") or data.get("ticket", ""))
+    close_price = float(data.get("close_price", 0))
+    reason = str(data.get("close_reason", "manual"))
+    was_tracked = trade_id in _lifecycle_manager._trades
+    _lifecycle_manager.remove_trade(trade_id)
+    return {"status": "closed" if was_tracked else "not_found",
+            "trade_id": trade_id, "close_reason": reason}
+
+
+@app.get("/lifecycle/status")
+def lifecycle_status():
+    """Returns all trades currently tracked by the lifecycle manager."""
+    return {
+        "active_trades": [
+            {"trade_id": t.trade_id, "symbol": t.symbol,
+             "direction": t.direction, "entry": t.entry_price,
+             "current_rr": round(t.current_rr, 2), "is_be": t.is_be}
+            for t in _lifecycle_manager._trades.values()
+        ],
+        "count": len(_lifecycle_manager._trades),
+    }
 
 # Delegate to canonical implementation (single source of truth in app/utils/symbols.py)
 def normalize_symbol(symbol: str) -> str:
     return _normalize_symbol(symbol)
-
 
 @app.post("/market-data")
 def market_data(data: dict, background_tasks: BackgroundTasks):
@@ -99,7 +170,7 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
     # Log live data (with correlation id)
     logger.info(f"[LIVE DATA {req_id}] {symbol} {timeframe} | Close={data.get('close')} | Bid={data.get('bid')} | Ask={data.get('ask')} | Volume={data.get('volume')}")
 
-    # Historical catch-up: never older than 24h — buffer + DB only, no signals/trades
+    # Historical catch-up: never older than 24h ΓÇö buffer + DB only, no signals/trades
     if is_backfill:
         from app.live_data import is_within_catchup_window, to_naive_utc
         ts_raw = data.get("timestamp")
@@ -172,7 +243,7 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
             sig = signal_result.get("signal", "HOLD")
             if sig in ("BUY", "SELL"):
                 eq = float(data.get("equity") or data.get("balance") or 200.0)
-                # Account-level (global) streak + daily PnL for hard circuits — not per-symbol
+                # Account-level (global) streak + daily PnL for hard circuits ΓÇö not per-symbol
                 streak = get_recent_loss_streak(None) or 0
                 today_r = get_today_realized_r(None) or 0.0
                 s = get_settings()
@@ -266,6 +337,74 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
                         signal_result["management"] = mgmts[0]
         except Exception as _me:
             pass  # non fatal
+
+        # ── [NEW] TradeLifecycleManager: on_bar for all tracked trades ──────
+        # Runs AFTER the management block; sends structure-aware post-entry actions
+        # (BE trigger, trail, CHoCH exit, scale-out) back in the response so the
+        # EA can act on them in the same tick.
+        try:
+            if _lifecycle_manager._trades:  # skip if no trades registered
+                from app.live_data import filter_df_to_catchup_window
+                from app.features.trade_lifecycle import MarketStructureSnapshot
+                from datetime import datetime as _dt
+                df_m5_lc = live_buffer.get_recent_m5_df(symbol, limit=200)
+                df_m5_lc = filter_df_to_catchup_window(df_m5_lc)
+                if df_m5_lc is not None and len(df_m5_lc) >= 5:
+                    from app.features.builder import compute_structure as _cs
+                    ms_lc = _cs(df_m5_lc, symbol=symbol, timeframe="M5", min_candles=5)
+                    ms_lc.current_price = float(data.get("close", 0) or ms_lc.current_price)
+                    _last_row = df_m5_lc.iloc[-1]
+                    _bar_high = float(_last_row.get("high", ms_lc.current_price))
+                    _bar_low  = float(_last_row.get("low",  ms_lc.current_price))
+                    _bar_open = float(_last_row.get("open", ms_lc.current_price))
+                    _bar_close = ms_lc.current_price
+
+                    # Build MarketStructureSnapshot from MarketStructure
+                    _last_choch = next(
+                        (b for b in reversed(ms_lc.breaks) if b.break_type == "CHOCH"), None
+                    )
+                    _ms_snap = MarketStructureSnapshot(
+                        last_choch_direction=(
+                            "bullish" if _last_choch and _last_choch.direction == "BULL"
+                            else "bearish" if _last_choch else None
+                        ),
+                        last_choch_price=_last_choch.broken_price if _last_choch else None,
+                        last_choch_bar=_last_choch.idx if _last_choch else 0,
+                        displacement_occurred=bool(ms_lc.recent_displacement),
+                        displacement_direction=(
+                            ms_lc.recent_displacement.get("direction", "").lower()
+                            if ms_lc.recent_displacement else None
+                        ),
+                        fvg_zones=[
+                            {"high": f.upper, "low": f.lower,
+                             "direction": f.fvg_type.lower(), "filled": f.is_filled}
+                            for f in (ms_lc.fvgs or [])
+                        ],
+                        ob_zones=[
+                            {"high": o.high, "low": o.low,
+                             "direction": o.ob_type.lower(), "mitigated": o.is_mitigated}
+                            for o in (ms_lc.order_blocks or [])
+                        ],
+                        current_bar_index=ms_lc.last_bar_idx,
+                    )
+
+                    lc_actions = _lifecycle_manager.on_bar(
+                        bar_open=_bar_open,
+                        bar_high=_bar_high,
+                        bar_low=_bar_low,
+                        bar_close=_bar_close,
+                        bar_time=_dt.utcnow(),
+                        ms=_ms_snap,
+                    )
+                    if lc_actions:
+                        lc_list = [a.to_dict() for a in lc_actions]
+                        response["lifecycle_actions"] = lc_list
+                        signal_result["lifecycle_actions"] = lc_list
+                        logger.info("[Lifecycle] %s: %d action(s): %s",
+                                    symbol, len(lc_list),
+                                    [a["event"] for a in lc_list])
+        except Exception as _lce:
+            logger.debug("[Lifecycle] on_bar error (non-fatal): %s", _lce)
     else:
         base_hold = {
             "signal": "HOLD",
@@ -274,7 +413,7 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
         }
         base_hold = _apply_system_mode_to_signal(base_hold, symbol)
         response["signal"] = base_hold
-        print(f"\n[REALTIME SIGNAL from POST] {symbol} {timeframe} → {base_hold.get('signal')} (not enough live bars yet)")
+        print(f"\n[REALTIME SIGNAL from POST] {symbol} {timeframe} ΓåÆ {base_hold.get('signal')} (not enough live bars yet)")
 
     # 4. Store to DB in background (after we already responded to MT5) - now using pool
     def _persist_to_db():
@@ -323,7 +462,6 @@ def market_data(data: dict, background_tasks: BackgroundTasks):
 
     return response
 
-
 # =============================================================================
 # DEBUG ENDPOINTS - Live Buffer Inspection
 # =============================================================================
@@ -337,14 +475,12 @@ def debug_live_buffer_all():
         "note": "Number of recent M1 bars kept in memory (buffer caps at 1w+4d=15840 before rewrite). Post-off trend/structure uses only 1440 (1 day) from market. Direct from market."
     }
 
-
 @app.get("/debug/live-buffer/{symbol}")
 def debug_live_buffer_symbol(symbol: str):
     """Returns detailed information about the live buffer for one symbol."""
     info = live_buffer.get_buffer_status(symbol)
     info["note"] = "Recent live data from market buffer (grows to 1w+4d=15840 before rewrite). After off, only 1440 for trend/structure. Direct from market, no DB."
     return info
-
 
 @app.post("/report-trade")
 def report_trade(trade: dict):
@@ -365,7 +501,6 @@ def report_trade(trade: dict):
     except Exception as e:
         logger.error(f"report_trade err: {e}")
         return {"status": "error", "detail": str(e)}
-
 
 @app.get("/api/open-trades")
 def api_open_trades(symbol: str = None, limit: int = 50):
@@ -427,7 +562,6 @@ def api_open_trades(symbol: str = None, limit: int = 50):
     except Exception as e:
         logger.error(f"open-trades err: {e}")
         return []
-
 
 @app.get("/api/health")
 def api_health():
@@ -628,7 +762,6 @@ def api_trades(symbol: str = None, limit: int = 200):
     except Exception as e:
         print(f"api_trades error: {e}")
         return []
-
 
 # =============================================================================
 # KILL SWITCH / CONTROL ENDPOINTS + MODE AWARENESS (Phase 2)
