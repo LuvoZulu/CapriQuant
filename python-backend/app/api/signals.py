@@ -266,7 +266,7 @@ def get_trading_signal(
         }
         print(f"\n[SIGNAL RESPONSE] {normalized} {tf_upper}", json.dumps(response_body, indent=2, default=str))
         # Still respect kill switch even on insufficient data path
-        response_body = _apply_system_mode_to_signal(response_body, normalized)
+        response_body = _apply_system_mode_to_signal(response_body)
         return response_body
 
     # Strongly prefer live aggregated data for real-time structure decisions
@@ -381,7 +381,7 @@ def get_trading_signal(
         response_body["signal"] = "HOLD"
 
     # Apply system kill/pause mode as final hard layer (after risk)
-    response_body = _apply_system_mode_to_signal(response_body, normalized)
+    response_body = _apply_system_mode_to_signal(response_body)
 
     # === Force live price into the response for real-time feel ===
     try:
