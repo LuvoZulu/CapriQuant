@@ -294,7 +294,7 @@ def get_trading_signal(
         # Use ?engine=structure_single for legacy single-TF behavior if needed.
         use_mtf = engine in ("mtf", "structure_mtf") or engine == "structure"
         if use_mtf:
-            result = get_mtf_structure_signal(normalized, spread=spread, min_candles_m1=8, equity=equity)
+            result = get_mtf_structure_signal(normalized, spread=spread, account_equity=equity)
             if result is None or result.get("signal") == "HOLD" and "Building" in str(result.get("rationale", "")):
                 # graceful fallback
                 ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 10)

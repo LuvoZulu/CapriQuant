@@ -69,6 +69,10 @@ _metrics: Dict[str, Any] = {
     "structure_compute_seconds": [],   # ring buffer last 100
 }
 
+# In-memory for dashboard endpoints (works even if DB is down)
+recent_signals_list: list = []
+closed_trades_list: list = []
+
 
 def normalize_symbol(symbol: str) -> str:
     return _normalize_symbol(symbol)
@@ -143,6 +147,47 @@ def system_status() -> Dict:
         "buffer_max_m1": 15840,
         "live_buffer_lengths": lengths,
     }
+
+
+# ── Missing dashboard endpoints (were causing 404s and breaking tabs) ───────
+@app.get("/api/system-mode")
+def api_system_mode() -> Dict:
+    return {"mode": get_system_mode()}
+
+@app.get("/api/alerts")
+def api_alerts() -> Dict:
+    return {"alerts": _compute_current_alerts()}
+
+@app.get("/api/recent-signals")
+def api_recent_signals(symbol: str = None, limit: int = 100) -> list:
+    data = recent_signals_list
+    if symbol:
+        s = normalize_symbol(symbol)
+        data = [d for d in data if normalize_symbol(d.get("symbol", "")) == s]
+    return list(reversed(data[-limit:]))  # newest first
+
+@app.get("/api/open-trades")
+def api_open_trades() -> list:
+    try:
+        ls = lifecycle_status()
+        trades = ls.get("active_trades", [])
+        return [
+            {
+                "ticket": t.get("trade_id"),
+                "symbol": t.get("symbol"),
+                "direction": t.get("direction"),
+                "entry_price": t.get("entry"),
+                "current_rr": t.get("current_rr", 0.0),
+                "is_be": t.get("is_be", False),
+            }
+            for t in trades
+        ]
+    except Exception:
+        return []
+
+@app.get("/api/trades")
+def api_trades(limit: int = 300) -> list:
+    return list(reversed(closed_trades_list[-limit:]))  # newest first
 
 
 # ── Prometheus metrics ─────────────────────────────────────────────────────
@@ -307,6 +352,24 @@ def market_data(data: dict, background_tasks: BackgroundTasks) -> Dict:  # noqa:
     signal = _apply_system_mode_to_signal(signal)
     _record_signal(str(signal.get("signal", "HOLD")))
 
+    # Record for /api/recent-signals (dashboard Structure tab)
+    try:
+        recent_signals_list.append({
+            "ts": datetime.utcnow().isoformat(),
+            "symbol": symbol,
+            "timeframe": "M1",
+            "signal": signal.get("signal"),
+            "score": signal.get("score", 0.0),
+            "confidence": signal.get("confidence", 0.0),
+            "setup": signal.get("setup"),
+            "rationale": signal.get("rationale"),
+            "current_price": signal.get("current_price"),
+        })
+        if len(recent_signals_list) > 200:
+            recent_signals_list.pop(0)
+    except Exception:
+        pass
+
     # ── Lifecycle management actions ──────────────────────────────────────
     lifecycle_actions = []
     try:
@@ -420,6 +483,25 @@ def report_trade(data: dict) -> Dict:
 
         # ── Persist to DB ────────────────────────────────────────────
         _persist_trade_close(data, symbol)
+
+        # Record for /api/trades (dashboard journal)
+        try:
+            pnl_for_list = float(pnl_pct or 0) * 100 if 'pnl_pct' in locals() and pnl_pct is not None else float(data.get("pnl_pct") or data.get("profit_pct") or 0)
+            closed_trades_list.append({
+                "ts": datetime.utcnow().isoformat(),
+                "ticket": str(data.get("ticket") or data.get("trade_id")),
+                "symbol": symbol,
+                "direction": str(data.get("direction", "")).lower(),
+                "entry_price": float(data.get("entry_price") or 0),
+                "close_price": float(data.get("close_price") or 0),
+                "pnl_pct": pnl_for_list,
+                "close_reason": str(data.get("close_reason") or "manual"),
+                "setup": str(data.get("setup") or ""),
+            })
+            if len(closed_trades_list) > 500:
+                closed_trades_list.pop(0)
+        except Exception:
+            pass
 
     # ── Lifecycle close notification ──────────────────────────────────────
     if event == "close":
