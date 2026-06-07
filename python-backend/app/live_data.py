@@ -215,7 +215,24 @@ def add_market_data(symbol: str, data: dict) -> None:
         # New minute started → append a new bar entry for the new minute (will be updated live)
         buffer.append(incoming_bar)
     else:
+        # Historical insert (backfill or out-of-order)
         _upsert_historical_bar(symbol, incoming_bar)
+
+    # Robustness for EA that may send M1 "bars" at tick frequency with slightly varying
+    # timestamps (or tick-derived ts instead of stable bar-open time).
+    # If the latest entry's minute is very close to the previous one, collapse so we don't
+    # bloat the buffer with 50+ "M1" entries in one real minute.
+    # Keep at most the true historical + one forming.
+    if len(buffer) >= 2:
+        prev = buffer[-2]
+        curr = buffer[-1]
+        prev_m = _floor_to_minute(prev["timestamp"])
+        curr_m = _floor_to_minute(curr["timestamp"])
+        if (curr_m - prev_m).total_seconds() / 60 <= 1:
+            # Merge curr into prev (or keep only the newest as forming) and drop the duplicate minute
+            _merge_bar(prev, curr, replace_open=True)
+            # pop the last (we merged into prev)
+            buffer.pop()
 
 
 def _merge_bar(existing: dict, incoming: dict, replace_open: bool = False) -> None:
