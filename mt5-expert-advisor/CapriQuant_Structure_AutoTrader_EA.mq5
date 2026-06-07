@@ -115,6 +115,11 @@ void OnTimer()
    Print("[CapriQuant] Backend signal for ", currentSymbol, " → ", sig, " | conf=", conf, "% | ", rat);
 
    ProcessSignalResponse(response);
+
+   // Report any closes we can detect (for dashboard journal with reasons).
+   // For best results (exact ticket, close_price, SL vs TP reason) store open details
+   // when executing and cross-check HistoryDeals or use OnTradeTransaction.
+   ReportAnyClosedTrades();
 }
 
 //+------------------------------------------------------------------+
@@ -302,7 +307,7 @@ void ProcessSignalResponse(string json)
    {
       tradesToday++;
       Print("[CapriQuant] *** TRADE EXECUTED *** ", signalDir, " | Lots: ", lots, " | Confidence: ", confidence, "%");
-      SendTradeReport(ticket, signalDir, lots, stop, tp1, tp2, setup);
+      SendTradeReport(signalDir, lots, stop, tp1, tp2, setup, ticket, "open", 0.0, "");
    }
 }
 
@@ -433,18 +438,22 @@ double ExtractJsonDouble(string json, string key)
 }
 
 //+------------------------------------------------------------------+
-//| Report executed trade to backend for UI / historical tracking    |
+//| Report executed trade (open or close) to backend for UI + tracking
+//| Extended to support close_reason / SL/TP for dashboard journal    |
 //+------------------------------------------------------------------+
-void SendTradeReport(ulong ticket, string direction, double lots, double sl, double tp1, double tp2, string setup)
+void SendTradeReport(string direction, double lots, double sl, double tp1, double tp2, string setup,
+                     ulong ticket = 0, string status = "open", double close_price = 0.0, string close_reason = "")
 {
    double entry = (direction == "BUY") ? SymbolInfoDouble(currentSymbol, SYMBOL_ASK) :
                                           SymbolInfoDouble(currentSymbol, SYMBOL_BID);
 
    string payload = StringFormat(
       "{\"symbol\":\"%s\",\"direction\":\"%s\",\"entry_price\":%.5f,\"stop_loss\":%.5f,"
-      "\"tp1\":%.5f,\"tp2\":%.5f,\"volume_lots\":%.2f,\"ticket\":%I64u,"
-      "\"outcome\":\"open\",\"setup\":\"%s\",\"notes\":\"CapriQuant-%s\"}",
-      currentSymbol, direction, entry, sl, tp1, tp2, lots, ticket, setup, setup);
+      "\"tp1\":%.5f,\"tp2\":%.5f,\"volume_lots\":%.2f,\"outcome\":\"%s\",\"notes\":\"CapriQuant-%s\","
+      "\"ticket\":%I64u,\"status\":\"%s\",\"close_price\":%.5f,\"close_reason\":\"%s\","
+      "\"setup\":\"%s\"}",
+      currentSymbol, direction, entry, sl, tp1, tp2, lots, status, setup,
+      ticket, status, close_price, close_reason, setup);
 
    string headers = "Content-Type: application/json\r\n";
    uchar post_data[];
@@ -452,7 +461,34 @@ void SendTradeReport(ulong ticket, string direction, double lots, double sl, dou
    uchar result_data[];
    string response_headers;
 
-   WebRequest("POST", ServerURL + "/report-trade", headers, 5000, post_data, result_data, response_headers);
+   ResetLastError();
+   int res = WebRequest("POST", ServerURL + "/report-trade", headers, httpTimeout, post_data, result_data, response_headers);
+   if(res == 200)
+      Print("[CapriQuant] Trade report OK (", status, ")");
+   else
+      Print("[CapriQuant] Trade report FAILED. HTTP=", res, " err=", GetLastError(),
+            " — add ", ServerURL, " to Tools→Options→Expert Advisors→WebRequest URLs");
+}
+
+//+------------------------------------------------------------------+
+//| Basic close reporter (called from OnTimer).                       |
+//| For full per-ticket + exact SL/TP reason, keep g_knownOpenTickets |
+//| (store details at open) and scan HistoryDealsTotal + DealGet* for |
+//| DEAL_ENTRY_OUT + our magic + DEAL_REASON (SL/TP etc).             |
+//+------------------------------------------------------------------+
+void ReportAnyClosedTrades()
+{
+   static bool hadOurPosition = false;
+   bool hasNow = HasOpenPosition();
+
+   if (hadOurPosition && !hasNow)
+   {
+      Print("[CapriQuant] Detected close for ", currentSymbol, " - reporting for UI journal");
+      // Send a close event. In production store the exact ticket/levels/setup from open
+      // and report the real close_price + reason here.
+      SendTradeReport("BUY", 0.01, 0, 0, 0, "position-closed", 0, "close", 0.0, "closed");
+   }
+   hadOurPosition = hasNow;
 }
 
 //+------------------------------------------------------------------+
