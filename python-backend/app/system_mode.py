@@ -1,151 +1,188 @@
 """
-System Mode / Kill Switch (shared module).
+CapriQuant system_mode.py — Kill Switch + System Control (Production)
+=====================================================================
 
-Provides non-bypassable control: trading | paused | flatten.
-Persisted to logs/system_mode.json for restart safety.
-Used by realtime ingest, /signal, /control, management, etc.
+Provides:
+  - get_system_mode() / set_system_mode()  — global trading state
+  - _apply_system_mode_to_signal()         — overlay on every outbound signal
+  - _flatten_signal_for_ea()              — FLATTEN_ALL signal format
+  - _compute_current_alerts()             — health alert generator
+  - record_quality_bad() / get_quality_issues() — data quality tracking
 
-Avoids circular imports between main <-> api.
+State is persisted to data/system_mode.json so restarts respect kill switch.
+
+CRITICAL: No circular imports.  This module imports nothing from app.*
+except config (which has no upward deps).
 """
-import os
+
+from __future__ import annotations
+
 import json
+import logging
+import os
+import threading
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, List, Optional
 
-# Module-relative logs/ for cwd independence (matches signal_logger fix)
-_CONTROL_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
-_CONTROL_DIR.mkdir(exist_ok=True)
-CONTROL_STATE_FILE = _CONTROL_DIR / "system_mode.json"
+logger = logging.getLogger(__name__)
 
-SYSTEM_MODE = "trading"  # default
+# ── State file ───────────────────────────────────────────────────────────────
+_MODE_FILE = Path("logs/system_mode.json")
+_lock = threading.Lock()
 
-# Simple recent ingest quality (last N bad per symbol) for /status
-_QUALITY_BAD: Dict[str, list] = {}  # symbol -> list of (ts, reasons)
-_MAX_QUALITY_BAD = 5
+_VALID_MODES = ("trading", "paused", "flatten")
+_mode: str = "trading"
+_mode_changed_at: Optional[datetime] = None
 
+# ── Quality tracking (per-symbol circular buffer) ──────────────────────────
+_quality_bad: Dict[str, List] = defaultdict(list)
+_MAX_QUALITY_ENTRIES = 20
 
-def _load_system_mode() -> str:
-    global SYSTEM_MODE
+# ── On import: restore mode from disk ────────────────────────────────────────
+def _load_mode() -> None:
+    global _mode, _mode_changed_at
     try:
-        if CONTROL_STATE_FILE.exists():
-            with open(CONTROL_STATE_FILE) as f:
-                data = json.load(f)
-                m = data.get("mode", "trading")
-                if m in ("trading", "paused", "flatten"):
-                    SYSTEM_MODE = m
-    except Exception:
-        pass
-    return SYSTEM_MODE
+        if _MODE_FILE.exists():
+            data = json.loads(_MODE_FILE.read_text())
+            persisted = data.get("mode", "trading")
+            if persisted in _VALID_MODES:
+                _mode = persisted
+                _mode_changed_at = datetime.utcnow()
+                logger.info("[SystemMode] Restored mode from disk: %s", _mode)
+    except Exception as exc:
+        logger.warning("[SystemMode] Could not load persisted mode: %s", exc)
 
 
-def _save_system_mode(mode: str) -> str:
-    global SYSTEM_MODE
-    if mode not in ("trading", "paused", "flatten"):
-        mode = "trading"
-    SYSTEM_MODE = mode
-    try:
-        with open(CONTROL_STATE_FILE, "w") as f:
-            json.dump({"mode": mode, "ts": datetime.utcnow().isoformat()}, f)
-    except Exception as e:
-        try:
-            import logging
-            logging.getLogger(__name__).error(f"Failed to persist system mode: {e}")
-        except Exception:
-            pass
-    return SYSTEM_MODE
+_load_mode()
 
 
-# init on import
-_load_system_mode()
-
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def get_system_mode() -> str:
-    return SYSTEM_MODE
+    """Return current trading mode: 'trading' | 'paused' | 'flatten'."""
+    return _mode
 
 
-def set_system_mode(mode: str) -> str:
-    return _save_system_mode(mode)
+def set_system_mode(new_mode: str) -> None:
+    """
+    Set trading mode.  Persisted to disk immediately.
+    'flatten' auto-transitions to 'paused' after one tick cycle
+    (the EA acts on FLATTEN_ALL, then we stay paused until manual resume).
+    """
+    global _mode, _mode_changed_at
+    if new_mode not in _VALID_MODES:
+        raise ValueError(f"Invalid mode '{new_mode}', must be one of {_VALID_MODES}")
+    with _lock:
+        _mode = new_mode
+        _mode_changed_at = datetime.utcnow()
+    _persist_mode()
+    logger.warning("[SystemMode] Mode changed to: %s", new_mode)
 
 
-def _apply_system_mode_to_signal(signal_dict: dict, symbol: str = "") -> dict:
-    """If system not in trading mode, override signal to HOLD or special FLATTEN."""
-    mode = get_system_mode()
-    if mode == "trading":
-        return signal_dict
-    out = dict(signal_dict) if isinstance(signal_dict, dict) else {"signal": "HOLD"}
-    if mode == "flatten":
-        out["signal"] = "FLATTEN"
-        out["rationale"] = (out.get("rationale", "") + " | SYSTEM FLATTEN: close all positions immediately.").strip()
-        out["action"] = "flatten_all"
-    else:  # paused
-        out["signal"] = "HOLD"
-        out["rationale"] = (out.get("rationale", "") + " | SYSTEM PAUSED via kill switch / control.").strip()
-    out["system_mode"] = mode
+def _persist_mode() -> None:
     try:
-        import logging
-        logging.getLogger(__name__).warning(f"[SYSTEM MODE] {symbol} overridden to {out['signal']} (mode={mode})")
-    except Exception:
-        pass
-    return out
+        _MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _MODE_FILE.write_text(json.dumps({
+            "mode": _mode,
+            "changed_at": _mode_changed_at.isoformat() if _mode_changed_at else None,
+        }, indent=2))
+    except Exception as exc:
+        logger.warning("[SystemMode] Failed to persist mode: %s", exc)
 
 
-def _flatten_signal_for_ea(response: dict, signal_result: dict) -> None:
+def _apply_system_mode_to_signal(signal: Dict) -> Dict:
     """
-    MT5 EA parses flat sig_* keys from POST /market-data responses.
-    The nested 'signal' object alone is not readable by the simple MQL5 JSON helpers.
+    Overlay system mode onto a generated signal.
+    - paused:  always HOLD
+    - flatten: FLATTEN_ALL (handled by EA as close-all + pause)
+    - trading: pass through
     """
-    if not isinstance(signal_result, dict):
-        return
-    response["sig_dir"] = signal_result.get("signal")
-    response["sig_confidence"] = signal_result.get("confidence")
-    response["sig_setup"] = signal_result.get("setup")
-    response["sig_rationale"] = signal_result.get("rationale")
-    stop = signal_result.get("validated_stop") or signal_result.get("stop_suggestion")
-    response["sig_stop_suggestion"] = stop
-    response["sig_tp1"] = signal_result.get("tp1")
-    response["sig_tp2"] = signal_result.get("tp2")
-    mgmt = signal_result.get("management")
-    if isinstance(mgmt, dict):
-        response["management_action"] = mgmt.get("action")
-        response["management_new_sl"] = mgmt.get("new_sl")
-        response["management_reason"] = mgmt.get("reason")
+    mode = get_system_mode()
+    if mode == "paused":
+        return {**signal, "signal": "HOLD", "hold_reason": "system_paused"}
+    if mode == "flatten":
+        result = _flatten_signal_for_ea(signal)
+        # Auto-transition to paused so next tick doesn't re-flatten
+        set_system_mode("paused")
+        return result
+    return signal
 
 
-def record_quality_bad(symbol: str, reasons: list) -> None:
-    global _QUALITY_BAD
-    if symbol not in _QUALITY_BAD:
-        _QUALITY_BAD[symbol] = []
-    _QUALITY_BAD[symbol].append((datetime.utcnow().isoformat(), reasons))
-    if len(_QUALITY_BAD[symbol]) > _MAX_QUALITY_BAD:
-        _QUALITY_BAD[symbol] = _QUALITY_BAD[symbol][- _MAX_QUALITY_BAD :]
+def _flatten_signal_for_ea(signal: Dict) -> Dict:
+    """Format a FLATTEN_ALL signal for the EA to close all positions."""
+    return {
+        **signal,
+        "signal": "FLATTEN_ALL",
+        "hold_reason": "kill_switch_flatten",
+        "flatten_all": True,
+        "close_reason": "kill_switch",
+    }
 
 
-def get_quality_issues() -> Dict[str, list]:
-    return {s: list(bads) for s, bads in _QUALITY_BAD.items()}
+def _compute_current_alerts() -> List[Dict]:
+    """
+    Generate operational alert dicts.  Called by /api/system-status.
+    Returns empty list if everything is healthy.
+    """
+    alerts: List[Dict] = []
 
-
-def _compute_current_alerts() -> list:
-    """Basic alerting based on current risk state + mode."""
-    from app.db import get_recent_loss_streak, get_today_realized_r
-    alerts = []
+    # Mode alert
     mode = get_system_mode()
     if mode != "trading":
-        alerts.append({"level": "critical", "type": "system_mode", "msg": f"System in {mode} mode - trading restricted"})
+        alerts.append({
+            "level": "WARNING",
+            "code": f"system_{mode}",
+            "message": f"System is in {mode.upper()} mode — no trades will be placed.",
+            "since": _mode_changed_at.isoformat() if _mode_changed_at else None,
+        })
 
+    # Quality alert (any symbol with recent bad ticks)
+    for sym, issues in list(_quality_bad.items()):
+        if issues:
+            recent = issues[-1]
+            alerts.append({
+                "level": "WARNING",
+                "code": "data_quality",
+                "symbol": sym,
+                "message": f"Data quality issues for {sym}: {recent.get('reasons', [])}",
+                "last_bad": recent.get("ts"),
+            })
+
+    # RiskManager halt alert
     try:
-        streak = get_recent_loss_streak(None) or 0
-        today_r = get_today_realized_r(None) or 0.0
-        if streak >= 3:
-            alerts.append({"level": "warning", "type": "streak", "msg": f"Loss streak = {streak}"})
-        if today_r < -3.0:  # rough R threshold
-            alerts.append({"level": "warning", "type": "daily_loss", "msg": f"Today realized R ~ {today_r:.1f}"})
+        from app.risk.risk_manager import get_risk_manager
+        rm = get_risk_manager()
+        rs = rm.get_state_dict()
+        if rs.get("is_halted"):
+            alerts.append({
+                "level": "CRITICAL",
+                "code": "risk_halt",
+                "message": f"RiskManager HALTED: {rs.get('halt_reason')}",
+            })
+        if rs.get("loss_streak", 0) >= 3:
+            alerts.append({
+                "level": "WARNING",
+                "code": "loss_streak",
+                "message": f"Loss streak: {rs['loss_streak']} consecutive losses",
+            })
     except Exception:
         pass
 
-    # quality issues
-    for s, bads in _QUALITY_BAD.items():
-        if len(bads) > 2:
-            alerts.append({"level": "info", "type": "data_quality", "msg": f"{s} has {len(bads)} recent bad ticks"})
-
     return alerts
+
+
+def record_quality_bad(symbol: str, reasons: List[str]) -> None:
+    """Record a bad-tick event for a symbol (used by data quality gate in main.py)."""
+    with _lock:
+        entry = {"ts": datetime.utcnow().isoformat(), "reasons": reasons}
+        _quality_bad[symbol].append(entry)
+        if len(_quality_bad[symbol]) > _MAX_QUALITY_ENTRIES:
+            _quality_bad[symbol] = _quality_bad[symbol][-_MAX_QUALITY_ENTRIES:]
+
+
+def get_quality_issues() -> Dict[str, List]:
+    """Return recent quality issues per symbol for status endpoint."""
+    with _lock:
+        return {k: list(v[-5:]) for k, v in _quality_bad.items() if v}
