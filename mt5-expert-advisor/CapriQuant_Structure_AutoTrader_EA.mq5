@@ -19,8 +19,11 @@
 // ==================== INPUTS ====================
 input string   ServerURL            = "http://127.0.0.1:8001";
 input int      TimerSeconds         = 7;                  // How often to send data + ask for signal
-input string   DataTimeframe        = "M5";               // Timeframe to send data for
+input string   DataTimeframe        = "M1";               // Backend expects M1 bars for MTF resampling
 input string   SignalTimeframe      = "M5";               // Timeframe to request signal for
+input bool     EnableStartupBackfill = true;              // Rebuild backend buffer after downtime
+input int      StartupBackfillBars  = 1440;               // Max one day of M1 bars
+input int      BackfillBatchBars    = 120;                // Bars to send per timer tick while live data continues
 
 input double   MinConfidence        = 68.0;               // Only trade if backend confidence >= this
 input double   RiskPercent          = 1.8;                // Risk per trade (% of equity)
@@ -38,6 +41,8 @@ int      tradesToday  = 0;
 int      httpTimeout  = 8000;
 string   currentSymbol;
 ENUM_TIMEFRAMES dataTF;
+int      backfillShift = 0;
+bool     backfillComplete = false;
 
 //+------------------------------------------------------------------+
 //| OnInit                                                           |
@@ -48,6 +53,8 @@ int OnInit()
    dataTF = StringToTimeframe(DataTimeframe);
 
    EventSetTimer(TimerSeconds);
+   backfillShift = MathMax(1, StartupBackfillBars);
+   backfillComplete = !EnableStartupBackfill;
 
    Print("================================================================");
    Print("=== CapriQuant STRUCTURE AUTO-TRADER v5.0                   ===");
@@ -91,10 +98,13 @@ void OnTimer()
 
    if(tradesToday >= MaxTradesPerDay) return;
 
-   // 1. Send latest market data
+   // 1. Send latest M1 market data first so current opportunities are never delayed
    SendMarketData();
 
-   // 2. Ask Python for a signal
+   // 2. Backfill missed closed M1 bars in small batches while live processing continues
+   SendStartupBackfillBatch();
+
+   // 3. Ask Python for a signal
    string response = GetStructureSignal(SignalTimeframe);
    if(response == "") return;
 
@@ -112,22 +122,63 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void SendMarketData()
 {
+   SendBarData(0, false);
+}
+
+//+------------------------------------------------------------------+
+//| Send missed closed M1 bars without blocking live processing      |
+//+------------------------------------------------------------------+
+void SendStartupBackfillBatch()
+{
+   if(backfillComplete) return;
+
+   int sent = 0;
+   while(backfillShift >= 1 && sent < BackfillBatchBars)
+   {
+      datetime barTime = iTime(currentSymbol, PERIOD_M1, backfillShift);
+      if(barTime > 0)
+      {
+         SendBarData(backfillShift, true);
+         sent++;
+      }
+      backfillShift--;
+   }
+
+   if(backfillShift < 1)
+   {
+      backfillComplete = true;
+      Print("[CapriQuant] Startup M1 backfill complete.");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Send one M1 bar to backend                                       |
+//+------------------------------------------------------------------+
+bool SendBarData(int shift, bool isBackfill)
+{
+   ENUM_TIMEFRAMES tf = PERIOD_M1;
+   datetime barTime = iTime(currentSymbol, tf, shift);
+   if(barTime <= 0) return false;
+
    double bid   = SymbolInfoDouble(currentSymbol, SYMBOL_BID);
    double ask   = SymbolInfoDouble(currentSymbol, SYMBOL_ASK);
-   double open  = iOpen(currentSymbol, dataTF, 0);
-   double high  = iHigh(currentSymbol, dataTF, 0);
-   double low   = iLow(currentSymbol, dataTF, 0);
-   double close = iClose(currentSymbol, dataTF, 0);
-   long   vol   = iVolume(currentSymbol, dataTF, 0);
+   double open  = iOpen(currentSymbol, tf, shift);
+   double high  = iHigh(currentSymbol, tf, shift);
+   double low   = iLow(currentSymbol, tf, shift);
+   double close = iClose(currentSymbol, tf, shift);
+   long   vol   = iVolume(currentSymbol, tf, shift);
 
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   string ts = TimeToString(barTime, TIME_DATE | TIME_SECONDS);
+   string backfill = isBackfill ? "true" : "false";
 
    string payload = StringFormat(
-      "{\"symbol\":\"%s\",\"timeframe\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,"
+      "{\"symbol\":\"%s\",\"timeframe\":\"M1\",\"timestamp\":\"%s\",\"backfill\":%s,"
+      "\"bid\":%.5f,\"ask\":%.5f,"
       "\"open\":%.5f,\"high\":%.5f,\"low\":%.5f,\"close\":%.5f,\"volume\":%d,"
       "\"balance\":%.2f,\"equity\":%.2f}",
-      currentSymbol, DataTimeframe, bid, ask, open, high, low, close, vol,
+      currentSymbol, ts, backfill, bid, ask, open, high, low, close, vol,
       balance, equity);
 
    string headers = "Content-Type: application/json\r\n";
@@ -136,7 +187,10 @@ void SendMarketData()
    uchar result_data[];
    string response_headers;
 
-   WebRequest("POST", ServerURL + "/market-data", headers, httpTimeout, post_data, result_data, response_headers);
+   int res = WebRequest("POST", ServerURL + "/market-data", headers, httpTimeout, post_data, result_data, response_headers);
+   if(res != 200 && !isBackfill)
+      Print("[CapriQuant] Live market-data POST failed. Code=", res);
+   return (res == 200);
 }
 
 //+------------------------------------------------------------------+

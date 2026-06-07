@@ -187,16 +187,18 @@ def add_market_data(symbol: str, data: dict) -> None:
     if not is_within_catchup_window(bar_minute):
         return
 
+    incoming_bar = {
+        "timestamp": bar_minute,
+        "open": open_,
+        "high": max(high, open_, close),
+        "low": min(low, open_, close),
+        "close": close,
+        "volume": volume,
+    }
+
     if not buffer:
         # First ever bar for this symbol
-        buffer.append({
-            "timestamp": bar_minute,
-            "open": open_,
-            "high": high,
-            "low": low,
-            "close": close,
-            "volume": volume,
-        })
+        buffer.append(incoming_bar)
         return
 
     last_bar = buffer[-1]
@@ -204,20 +206,46 @@ def add_market_data(symbol: str, data: dict) -> None:
 
     if last_minute == bar_minute:
         # Still inside the same minute → update the current forming bar live
-        last_bar["high"] = max(last_bar["high"], high)
-        last_bar["low"] = min(last_bar["low"], low)
-        last_bar["close"] = close
-        last_bar["volume"] += volume
-    else:
+        _merge_bar(last_bar, incoming_bar, replace_open=False)
+    elif bar_minute > last_minute:
         # New minute started → append a new bar entry for the new minute (will be updated live)
-        buffer.append({
-            "timestamp": bar_minute,
-            "open": open_,
-            "high": high,
-            "low": low,
-            "close": close,
-            "volume": volume,
-        })
+        buffer.append(incoming_bar)
+    else:
+        _upsert_historical_bar(symbol, incoming_bar)
+
+
+def _merge_bar(existing: dict, incoming: dict, replace_open: bool = False) -> None:
+    """Merge a duplicate-minute bar without double-counting cumulative MT5 volume."""
+    if replace_open:
+        existing["open"] = incoming["open"]
+    existing["high"] = max(float(existing.get("high", 0)), float(incoming.get("high", 0)))
+    existing["low"] = min(float(existing.get("low", 0)), float(incoming.get("low", 0)))
+    existing["close"] = float(incoming.get("close", existing.get("close", 0)))
+    # MT5 iVolume is usually cumulative for the forming bar. Use max instead
+    # of addition so repeated posts of the same minute do not inflate volume.
+    existing["volume"] = max(float(existing.get("volume", 0)), float(incoming.get("volume", 0)))
+
+
+def _upsert_historical_bar(symbol: str, bar: dict) -> None:
+    """Insert or replace a backfilled bar while preserving chronological order."""
+    buffer = LIVE_BARS[symbol]
+    bars = list(buffer)
+    ts = bar["timestamp"]
+
+    for idx, existing in enumerate(bars):
+        existing_ts = _floor_to_minute(existing["timestamp"])
+        if existing_ts == ts:
+            _merge_bar(existing, bar, replace_open=True)
+            bars[idx] = existing
+            LIVE_BARS[symbol] = deque(bars[-(MAX_COMPLETED_BARS + 1):], maxlen=MAX_COMPLETED_BARS + 1)
+            return
+        if existing_ts > ts:
+            bars.insert(idx, bar)
+            LIVE_BARS[symbol] = deque(bars[-(MAX_COMPLETED_BARS + 1):], maxlen=MAX_COMPLETED_BARS + 1)
+            return
+
+    bars.append(bar)
+    LIVE_BARS[symbol] = deque(bars[-(MAX_COMPLETED_BARS + 1):], maxlen=MAX_COMPLETED_BARS + 1)
 
 
 def resample_ohlcv(df_m1: pd.DataFrame, minutes: int = 5) -> pd.DataFrame:
