@@ -301,22 +301,15 @@ def market_data(data: dict, background_tasks: BackgroundTasks) -> Dict:  # noqa:
     )
 
     # ── Update live buffer (always, for both live and backfill).
-    # Backfill from EA is the explicit startup seed of recent M1 history.
-    # We want it in the buffer so candles_available and structure see the bars quickly.
-    # The catchup window / stale filter protects *decisions*, not buffer population.
-    # ── Update live buffer ───────────────────────────────────────────────
+    # (Principle from the version where data handling was perfect: population of the
+    #  M1 buffer + side effects that drive UI counts (ticks, candlesticks, M5) must
+    #  happen for every payload the EA sends. Only the expensive signal computation
+    #  is conditional on "not stale".)
     update_live_bar(symbol, data)
 
-    # ── Historical catch-up guard for decisions (after buffering) ────────
-    if is_backfill:
-        from app.live_data import is_within_catchup_window, to_naive_utc
-        ts_raw = data.get("timestamp")
-        if ts_raw is not None and not is_within_catchup_window(to_naive_utc(ts_raw)):
-            logger.info("[BACKFILL %s] buffered but skipped for decisions (stale) for %s", req_id, symbol)
-            _persist_tick_to_db(symbol, timeframe, data, background_tasks)
-            return {"status": "backfill_buffered_skipped_decisions", "symbol": symbol}
-
-    # ── Update equity in RiskManager if EA sends it ─────────────────────
+    # ── Equity + persist for all payloads (live + the recent backfill the EA sends).
+    # This ensures the buffer numbers the frontend uses for M5 buffer, M1 candlesticks,
+    # and "ticks received" keep updating even when the EA is in its backfill batch phase.
     equity = data.get("equity") or data.get("account_equity")
     if equity:
         try:
@@ -325,9 +318,19 @@ def market_data(data: dict, background_tasks: BackgroundTasks) -> Dict:  # noqa:
         except Exception as exc:
             logger.debug("[RM] equity update failed: %s", exc)
 
+    _persist_tick_to_db(symbol, timeframe, data, background_tasks)
+
+    # ── Only for clearly stale backfill do we skip the M1 signal path.
+    # Recent backfill data has already driven the buffer + equity + persist above.
+    if is_backfill:
+        from app.live_data import is_within_catchup_window, to_naive_utc
+        ts_raw = data.get("timestamp")
+        if ts_raw is not None and not is_within_catchup_window(to_naive_utc(ts_raw)):
+            logger.info("[BACKFILL %s] buffer+side-effects done, skipping heavy M1 signal (stale) for %s", req_id, symbol)
+            return {"status": "backfill_buffered_skipped_decisions", "symbol": symbol}
+
     # ── Only compute signal on M1 (main tick timeframe) ──────────────────
     if timeframe != "M1" or bad_reasons:
-        _persist_tick_to_db(symbol, timeframe, data, background_tasks)
         return {"status": "buffered", "symbol": symbol, "timeframe": timeframe}
 
     # ── Kill switch check ────────────────────────────────────────────────

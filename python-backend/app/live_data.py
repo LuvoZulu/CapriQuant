@@ -194,15 +194,21 @@ def add_market_data(symbol: str, data: dict) -> None:
     last_bar = buffer[-1]
     last_minute = _floor_to_minute(last_bar["timestamp"])
 
-    if last_minute == bar_minute:
-        # Still inside the same minute → update the current forming bar live
-        _merge_bar(last_bar, incoming_bar, replace_open=False)
+    # Core principle adapted from the working-good data layer (where ticks/candlesticks/M5
+    # updated constantly on *every* EA payload):
+    # Treat anything whose floored minute is the same as the last entry *or within a small
+    # window of it* as "the current live/forming minute" and mutate the last bar in place.
+    # This guarantees that repeated sends for the forming bar (or the just-rolled minute)
+    # always cause visible updates to the last entry, TICK_STATS, bars_completed, forming_bar,
+    # and (via resample) the m5_bars_in_buffer that the frontend reads for M5 progress.
+    # Only true older historical data goes through upsert; new future minutes append.
+    minute_diff = (bar_minute - last_minute).total_seconds() / 60.0
+    if abs(minute_diff) <= 2:   # same or within ~2 min window → treat as current forming and update in place
+        _merge_bar(last_bar, incoming_bar, replace_open=(minute_diff > 0))
+    elif bar_minute > last_minute:
+        buffer.append(incoming_bar)
     else:
-        # New minute (or historical older) → append (for live new minute) or upsert for old backfill
-        if bar_minute > last_minute:
-            buffer.append(incoming_bar)
-        else:
-            _upsert_historical_bar(symbol, incoming_bar)
+        _upsert_historical_bar(symbol, incoming_bar)
 
 
 def _merge_bar(existing: dict, incoming: dict, replace_open: bool = False) -> None:
