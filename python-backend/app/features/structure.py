@@ -16,7 +16,7 @@ Design goals:
 - Demote reliance on lagging oscillators (EMA/RSI/MACD removed from core)
 - Optimized for XAUUSD, US30, NAS100, GER30 on M5-H1
 
-No external TA libs required — pure pandas + numpy.
+No external TA libs required ΓÇö pure pandas + numpy.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ from datetime import datetime, time
 import pandas as pd
 import numpy as np
 
-
 # =============================================================================
 # TYPES
 # =============================================================================
@@ -34,7 +33,6 @@ import numpy as np
 SwingType = Literal["HIGH", "LOW"]
 StructureBias = Literal["BULLISH", "BEARISH", "NEUTRAL", "CHOP"]
 SessionPhase = Literal["ASIAN", "LONDON_OPEN", "NY_OPEN", "NY_PM", "OFF_SESSION", "UNKNOWN"]
-
 
 @dataclass
 class Swing:
@@ -45,7 +43,6 @@ class Swing:
     strength: float             # 0.0 - 1.0 (how many bars confirmed + relative size)
     is_confirmed: bool = True
 
-
 @dataclass
 class StructureBreak:
     idx: int
@@ -54,7 +51,6 @@ class StructureBreak:
     direction: Literal["BULL", "BEAR"]  # BULL = broke resistance (prior high)
     broken_price: float
     confirming_price: float
-
 
 @dataclass
 class OrderBlock:
@@ -69,7 +65,6 @@ class OrderBlock:
     mitigation_idx: Optional[int] = None
     strength: float = 1.0         # based on displacement + volume if available
 
-
 @dataclass
 class LiquidityLevel:
     price: float
@@ -77,7 +72,6 @@ class LiquidityLevel:
     count: int                    # how many touches / equal points
     strength: float
     last_touched_idx: int
-
 
 @dataclass
 class FairValueGap:
@@ -90,7 +84,6 @@ class FairValueGap:
     is_filled: bool = False
     fill_idx: Optional[int] = None
 
-
 @dataclass
 @dataclass
 class SessionRange:
@@ -101,7 +94,6 @@ class SessionRange:
     is_expanded: bool = False
     expansion_direction: Optional[Literal["UP", "DOWN"]] = None
     manipulation_detected: bool = False   # London sweep of Asian range
-
 
 @dataclass
 class MarketStructure:
@@ -131,9 +123,12 @@ class MarketStructure:
     current_price: float = 0.0
     atr: float = 0.0
 
+    # CRT Strategy instance — populated by multi_timeframe when M15 data available
+    crt_instance: Optional[object] = field(default=None, repr=False)
+
     def to_dict(self) -> Dict:
         """JSON serializable summary (for API responses)."""
-        return {
+        base = {
             "symbol": self.symbol,
             "timeframe": self.timeframe,
             "bias": self.bias,
@@ -142,17 +137,44 @@ class MarketStructure:
             "current_price": round(self.current_price, 5),
             "atr": round(self.atr, 5),
             "swing_count": len(self.swings),
-            "active_bullish_obs": len([ob for ob in self.order_blocks if ob.ob_type == "BULLISH" and not ob.is_mitigated]),
-            "active_bearish_obs": len([ob for ob in self.order_blocks if ob.ob_type == "BEARISH" and not ob.is_mitigated]),
-            "unfilled_bull_fvgs": len([f for f in self.fvgs if f.fvg_type == "BULLISH" and not f.is_filled]),
-            "unfilled_bear_fvgs": len([f for f in self.fvgs if f.fvg_type == "BEARISH" and not f.is_filled]),
+            "active_bullish_obs": len(
+                [ob for ob in self.order_blocks
+                 if ob.ob_type == "BULLISH" and not ob.is_mitigated]
+            ),
+            "active_bearish_obs": len(
+                [ob for ob in self.order_blocks
+                 if ob.ob_type == "BEARISH" and not ob.is_mitigated]
+            ),
+            "unfilled_bull_fvgs": len(
+                [f for f in self.fvgs if f.fvg_type == "BULLISH" and not f.is_filled]
+            ),
+            "unfilled_bear_fvgs": len(
+                [f for f in self.fvgs if f.fvg_type == "BEARISH" and not f.is_filled]
+            ),
             "liquidity_levels": len(self.liquidity_levels),
             "recent_bos_choch": [
-                {"type": b.break_type, "direction": b.direction, "price": round(b.broken_price, 5)}
+                {"type": b.break_type, "direction": b.direction,
+                 "price": round(b.broken_price, 5)}
                 for b in self.breaks[-3:]
             ],
         }
 
+        # ── CRT levels (populated when crt_instance is wired in) ──────────
+        if self.crt_instance is not None:
+            try:
+                base["crt_levels"] = self.crt_instance.get_active_levels()
+                crt_setups = self.crt_instance.evaluate_crt_setups(
+                    self.current_price, htf_direction=self.bias
+                )
+                base["crt_setups"] = [s.to_dict() for s in crt_setups]
+            except Exception:
+                base["crt_levels"] = []
+                base["crt_setups"] = []
+        else:
+            base["crt_levels"] = []
+            base["crt_setups"] = []
+
+        return base
 
 # =============================================================================
 # CORE HELPERS
@@ -174,7 +196,6 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     atr = tr.ewm(alpha=1/period, adjust=False).mean()
     return atr
 
-
 def detect_displacement(df: pd.DataFrame, atr: pd.Series, min_mult: float = 1.7) -> pd.Series:
     """
     A candle is 'displacing' if its range is large relative to ATR
@@ -188,7 +209,6 @@ def detect_displacement(df: pd.DataFrame, atr: pd.Series, min_mult: float = 1.7)
     strong_close = (close_pos > 0.75) | (close_pos < 0.25)
 
     return strong_range & strong_close
-
 
 # =============================================================================
 # SWING / PIVOT DETECTION (THE FOUNDATION)
@@ -300,7 +320,6 @@ def find_swings(
 
     return swings
 
-
 # =============================================================================
 # STRUCTURE LABELING + BOS / CHOCH
 # =============================================================================
@@ -346,7 +365,7 @@ def detect_structure_breaks(
                     ))
                     bias = "BULLISH"
                 else:
-                    # Was bearish, broke prior high → CHOCH bullish
+                    # Was bearish, broke prior high ΓåÆ CHOCH bullish
                     breaks.append(StructureBreak(
                         idx=s.idx,
                         timestamp=s.timestamp,
@@ -391,7 +410,6 @@ def detect_structure_breaks(
             bias = "BEARISH"
 
     return breaks, bias
-
 
 # =============================================================================
 # ORDER BLOCKS (The real "support/resistance" in SMC)
@@ -524,7 +542,6 @@ def identify_order_blocks(
     obs.sort(key=lambda o: (not o.is_mitigated, o.strength, o.idx), reverse=True)
     return obs[:12]  # cap for practicality
 
-
 # =============================================================================
 # LIQUIDITY & FVGs
 # =============================================================================
@@ -582,7 +599,6 @@ def find_liquidity_levels(
             deduped.append(lvl)
     return deduped[:8]
 
-
 def find_fvgs(
     df: pd.DataFrame,
     atr: pd.Series,
@@ -638,7 +654,6 @@ def find_fvgs(
                     break
 
     return fvgs[-10:]  # recent only
-
 
 # =============================================================================
 # SESSION / AMD ANALYSIS (Much better than hardcoded hours)
@@ -760,7 +775,6 @@ def analyze_session_structure(
         manipulation_detected=manipulation,
     )
 
-
 # =============================================================================
 # MAIN ENTRYPOINT
 # =============================================================================
@@ -785,7 +799,7 @@ def compute_market_structure(
     if len(df) < min_candles:
         if len(df) < 5:
             raise ValueError(f"Need at least 5 candles to run structure analysis (got {len(df)})")
-        # Soft warning path for testing — we allow it but it's not ideal
+        # Soft warning path for testing ΓÇö we allow it but it's not ideal
         print(f"[Structure] Warning: Running with only {len(df)} candles (min recommended: {min_candles})")
 
     df = df.copy()
@@ -842,7 +856,6 @@ def compute_market_structure(
     )
     return ms
 
-
 # =============================================================================
 # HUMAN READABLE PROGRESS / STATUS SUMMARY (used by realtime responses + UI)
 # =============================================================================
@@ -889,7 +902,6 @@ def generate_structure_summary(ms: MarketStructure) -> str:
         ).strip()
     except Exception:
         return f"{getattr(ms, 'bias', 'NEUTRAL')} bias | limited data"
-
 
 # Convenience: lightweight dict for gradual migration (old-style consumers)
 def market_structure_to_legacy_features(ms: MarketStructure, df: pd.DataFrame) -> Dict:

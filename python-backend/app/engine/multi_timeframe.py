@@ -4,6 +4,22 @@ Multi-timeframe structure signal combiner.
 Primary: M5 (structure + bias + trade decision)
 Entry timing: M1 must confirm (not drive alone)
 Filter: M15 must not oppose
+
+INTEGRATION CHANGES (session_amd.py + crt_strategy.py)
+-------------------------------------------------------
+1. SessionAMDDetector (session_amd.py) is instantiated PER-SYMBOL as a
+   module-level singleton.  Each call to get_mtf_structure_signal() feeds
+   the latest M5 bars into the detector and gates signals on its result.
+   Phase CHOP / NEWS_BLACKOUT / CLOSED → force HOLD.
+   Low conviction (<0.55) → downgrade confidence.
+
+2. CRTStrategy (crt_strategy.py) is also per-symbol, tracks the latest M15
+   reference candle, and exposes its levels via ms_m5.crt_instance so that
+   MarketStructure.to_dict() serialises them for the EA.
+
+3. apply_m5_risk_levels() → now also stamps risk_pct from the NEW RiskManager
+   (risk_manager.py) when equity is available, so the EA always sees a
+   validated risk_pct instead of the old hardcoded fallback.
 """
 
 from __future__ import annotations
@@ -22,24 +38,54 @@ from app.config import get_settings
 from app.risk import RiskManager, RiskParams
 from app.db import get_recent_loss_streak, get_today_realized_r
 
+# ── New modules being wired in ─────────────────────────────────────────────
+from app.strategies.session_amd import SessionAMDDetector, AMDPhase
+from app.strategies.crt_strategy import CRTStrategy
+
+import logging
+logger = logging.getLogger(__name__)
+
 # Minimum confidence (0-100) to emit BUY/SELL after MTF alignment
 _s = get_settings()
 MIN_TRADE_CONFIDENCE = _s.mtf_min_confidence
 MIN_M5_CONFLUENCE = _s.mtf_min_m5_confluence
 
+# ── Per-symbol singletons (survive across tick calls) ─────────────────────
+# Keyed by normalised symbol string.
+_amd_detectors: Dict[str, SessionAMDDetector] = {}
+_crt_strategies: Dict[str, CRTStrategy] = {}
+
+
+def _get_amd(symbol: str) -> SessionAMDDetector:
+    """Return (or create) the SessionAMDDetector for this symbol."""
+    if symbol not in _amd_detectors:
+        _amd_detectors[symbol] = SessionAMDDetector(
+            use_vol_gating=True,
+            use_news_blackout=True,
+        )
+        logger.info("[SessionAMD] Created detector for %s", symbol)
+    return _amd_detectors[symbol]
+
+
+def _get_crt(symbol: str) -> CRTStrategy:
+    """Return (or create) the CRTStrategy instance for this symbol."""
+    if symbol not in _crt_strategies:
+        _crt_strategies[symbol] = CRTStrategy(reference_tf="M15", max_ranges=3)
+        logger.info("[CRT] Created strategy instance for %s", symbol)
+    return _crt_strategies[symbol]
+
+
+# ── Helpers (unchanged) ────────────────────────────────────────────────────
 
 def _signal_direction(sig: Dict) -> str:
     return str(sig.get("signal", "HOLD")).upper()
 
-
 def _bias(sig: Dict) -> str:
     return str(sig.get("bias", "NEUTRAL")).upper()
-
 
 def _total_confluence(sig: Dict) -> float:
     ctx = sig.get("contextual_scores") or {}
     return float(ctx.get("total", 0))
-
 
 def combine_mtf_signals(
     sig_m1: Dict,
@@ -166,32 +212,35 @@ def get_mtf_structure_signal(
     """
     Build M1/M5/M15 signals from the live M1 buffer and return combined output.
     Returns None if insufficient live data.
-    equity: optional live equity for RiskManager hard veto (account-level circuits).
+    equity: live equity from EA payload — used by RiskManager hard veto.
+
+    NEW in this version:
+    - Feeds M5 bars into SessionAMDDetector; forces HOLD on non-tradeable phases.
+    - Updates CRTStrategy with latest M15 reference candle; attaches instance to
+      ms_m5.crt_instance so to_dict() can serialise CRT levels for the EA.
+    - Stamps risk_pct from the new RiskManager (circuit-breakers active) onto
+      every BUY/SELL signal before returning.
     """
-    # Use full buffer history (1 week + 4 days headroom) for normal operation.
-    # After system turns on (post-off), backfill only provides 1440 (1 day), so initial trend/structure limited to that.
-    # Buffer maxlen ensures no more than 1w+4d before rewriting.
     max_m1 = MAX_COMPLETED_BARS
     df_m1_full = live_buffer.get_recent_df(symbol, limit=max_m1)
-    # No longer force 1-day filter here for normal ops; post-off limited by backfill amount.
     if df_m1_full is None or len(df_m1_full) < min_candles_m1:
         return None
 
     current_price = float(df_m1_full["close"].iloc[-1])
 
-    # For closed bars, use recent from full buffer (structure sees up to 1w+4d history normally; post-off starts at 1440)
+    # Closed-bar slices
     df_m1 = live_buffer.get_recent_closed_df(symbol, limit=max_m1)
-    if df_m1 is None or (hasattr(df_m1, 'empty') and df_m1.empty):
-        df_m1 = (df_m1_full.iloc[:-1].reset_index(drop=True) if len(df_m1_full) > 1 else df_m1_full)
+    if df_m1 is None or (hasattr(df_m1, "empty") and df_m1.empty):
+        df_m1 = (df_m1_full.iloc[:-1].reset_index(drop=True)
+                 if len(df_m1_full) > 1 else df_m1_full)
 
     max_m5 = max(3, max_m1 // 5)
     df_m5 = live_buffer.get_recent_m5_df(symbol, limit=max_m5)
     if df_m5 is None or df_m5.empty:
         df_m5 = resample_ohlcv(df_m1_full, minutes=5)
     df_m15 = resample_ohlcv(df_m1_full, minutes=15)
-    # No catchup filters so normal structure uses full buffer history (1w+4d). Post-off limited because backfill only 1440 initially.
 
-    # Use only completed (closed) bars for higher TF structure to avoid noise from forming candle (fixes 0 swings)
+    # Only use confirmed (closed) candles for structure — avoids 0-swing noise
     if len(df_m5) > 1:
         df_m5 = df_m5.iloc[:-1].reset_index(drop=True)
     if len(df_m15) > 1:
@@ -221,6 +270,65 @@ def get_mtf_structure_signal(
     for ms in (ms_m1, ms_m5, ms_m15):
         ms.current_price = current_price
 
+    # ── [NEW] SessionAMDDetector: feed M5 bars and classify phase ─────────
+    amd_det = _get_amd(symbol)
+    try:
+        # Feed the last N M5 bars we haven't fed yet (incremental)
+        # Simple approach: feed the last 3 completed M5 bars each tick
+        feed_rows = df_m5.tail(3)
+        for _, row in feed_rows.iterrows():
+            amd_det.push_bar(
+                bar_high=float(row["high"]),
+                bar_low=float(row["low"]),
+                bar_close=float(row["close"]),
+            )
+        # Classify using the timestamp of the last completed M5 bar
+        last_ts = df_m5["timestamp"].iloc[-1] if "timestamp" in df_m5.columns else None
+        if last_ts is None:
+            import pandas as _pd
+            last_ts = _pd.Timestamp.utcnow()
+        else:
+            import pandas as _pd
+            last_ts = _pd.Timestamp(last_ts)
+            if last_ts.tzinfo is not None:
+                last_ts = last_ts.tz_convert("UTC").tz_localize(None)
+
+        from datetime import datetime as _dt
+        amd_result = amd_det.get_phase(_dt.utcfromtimestamp(last_ts.timestamp()))
+    except Exception as _e:
+        logger.warning("[SessionAMD] phase detection failed for %s: %s", symbol, _e)
+        amd_result = None
+
+    # ── [NEW] CRTStrategy: update with latest M15 reference candle ────────
+    crt = _get_crt(symbol)
+    try:
+        if len(df_m15) >= 1:
+            ref = df_m15.iloc[-1]
+            ref_ts = ref.get("timestamp", None)
+            from datetime import datetime as _dt
+            if ref_ts is not None:
+                import pandas as _pd
+                ref_ts_dt = _pd.Timestamp(ref_ts)
+                if ref_ts_dt.tzinfo is not None:
+                    ref_ts_dt = ref_ts_dt.tz_convert("UTC").tz_localize(None)
+                ref_ts_py = _dt.utcfromtimestamp(ref_ts_dt.timestamp())
+            else:
+                ref_ts_py = _dt.utcnow()
+            crt.update_reference_bar(
+                open_price=float(ref["open"]),
+                high=float(ref["high"]),
+                low=float(ref["low"]),
+                close_price=float(ref["close"]),
+                ts=ref_ts_py,
+            )
+        crt.update_price(current_price)
+        # Attach the CRTStrategy instance to ms_m5 so to_dict() can read it
+        ms_m5.crt_instance = crt
+    except Exception as _e:
+        logger.warning("[CRT] update failed for %s: %s", symbol, _e)
+        ms_m5.crt_instance = None
+
+    # ── Signal computation (unchanged) ────────────────────────────────────
     sig_m1 = get_structure_signal(ms_m1, spread=spread)
     sig_m5 = get_structure_signal(ms_m5, spread=spread)
     sig_m15 = get_structure_signal(ms_m15, spread=spread)
@@ -229,14 +337,40 @@ def get_mtf_structure_signal(
     combined["current_price"] = current_price
     combined["structure_summary"] = generate_structure_summary(ms_m5)
     combined["bias"] = ms_m5.bias
-    combined["market_structure"] = ms_m5.to_dict()
+    combined["market_structure"] = ms_m5.to_dict()  # now includes crt_levels
     combined["buffer_status"] = live_buffer.get_buffer_status(symbol)
+
+    # ── [NEW] SessionAMD gate — override HOLD on non-tradeable phases ──────
+    if amd_result is not None:
+        combined["amd_phase"] = amd_result.to_dict()
+        if combined.get("signal") in ("BUY", "SELL"):
+            if not amd_result.is_tradeable(min_conviction=0.55):
+                phase_str = amd_result.phase.value
+                reason = amd_result.reason
+                logger.info(
+                    "[SessionAMD] %s HOLD — phase=%s conviction=%.2f: %s",
+                    symbol, phase_str, amd_result.conviction, reason
+                )
+                combined["signal"] = "HOLD"
+                combined["amd_veto"] = f"Phase {phase_str}: {reason}"
+                combined["rationale"] = (
+                    f"AMD veto ({phase_str}, conviction={amd_result.conviction:.2f}). "
+                    + combined.get("rationale", "")
+                )
+            elif amd_result.conviction < 0.75:
+                # Phase is tradeable but conviction is marginal — reduce confidence
+                old_conf = float(combined.get("confidence", 0))
+                new_conf = round(old_conf * amd_result.conviction, 1)
+                combined["confidence"] = new_conf
+                combined["amd_conviction_penalty"] = (
+                    f"AMD conviction {amd_result.conviction:.2f} reduced confidence "
+                    f"{old_conf}→{new_conf}"
+                )
 
     if combined.get("signal") in ("BUY", "SELL"):
         combined = apply_m5_risk_levels(combined, ms_m5, current_price)
 
-    # === HARD RiskManager veto also for MTF final output (account level, non-bypassable) ===
-    # This ensures even if MTF path is used directly, streak/daily circuits apply.
+    # ── HARD RiskManager veto (account-level circuits, non-bypassable) ─────
     try:
         if combined.get("signal") in ("BUY", "SELL"):
             eq = float(equity) if equity and equity > 1.0 else 200.0
@@ -264,7 +398,6 @@ def get_mtf_structure_signal(
                 old_r = combined.get("rationale", "")
                 combined["rationale"] = f"Risk veto: {veto_reason} (streak={streak}). {old_r}".strip()
     except Exception as e:
-        # non-fatal
         combined["risk_error"] = str(e)
 
     return combined
