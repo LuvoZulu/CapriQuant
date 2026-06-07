@@ -74,18 +74,12 @@ def to_naive_utc(ts) -> datetime:
     """
     Normalize any timestamp to naive UTC (no tzinfo).
     Prevents pandas sort errors when mixing DB backfill + live ticks.
+    (Aligned to working version for reliable minute flooring and merge on live ticks.)
     """
     if ts is None:
         return datetime.utcnow()
     if isinstance(ts, str):
-        raw = ts.strip()
-        # MT5 TimeToString: "2026.06.04 12:00:00"
-        if len(raw) >= 17 and raw[4] == "." and raw[7] == ".":
-            try:
-                return datetime.strptime(raw, "%Y.%m.%d %H:%M:%S")
-            except ValueError:
-                pass
-        ts = pd.to_datetime(raw, utc=True)
+        ts = pd.to_datetime(ts, utc=True)
     if isinstance(ts, pd.Timestamp):
         ts = ts.to_pydatetime()
     if isinstance(ts, datetime) and ts.tzinfo is not None:
@@ -183,14 +177,6 @@ def add_market_data(symbol: str, data: dict) -> None:
 
     bar_minute = _floor_to_minute(ts)
 
-    is_backfill = data.get("backfill") in (True, "true", 1, "1", "True")
-
-    # Reject stale historical bars (EA backfill mistakes or old DB replay).
-    # But *always* accept explicit backfill from the EA (its startup history seed).
-    # The catchup filter is applied later for structure decisions.
-    if not is_backfill and not is_within_catchup_window(bar_minute):
-        return
-
     incoming_bar = {
         "timestamp": bar_minute,
         "open": open_,
@@ -211,28 +197,12 @@ def add_market_data(symbol: str, data: dict) -> None:
     if last_minute == bar_minute:
         # Still inside the same minute → update the current forming bar live
         _merge_bar(last_bar, incoming_bar, replace_open=False)
-    elif bar_minute > last_minute:
-        # New minute started → append a new bar entry for the new minute (will be updated live)
-        buffer.append(incoming_bar)
     else:
-        # Historical insert (backfill or out-of-order)
-        _upsert_historical_bar(symbol, incoming_bar)
-
-    # Robustness for EA that may send M1 "bars" at tick frequency with slightly varying
-    # timestamps (or tick-derived ts instead of stable bar-open time).
-    # If the latest entry's minute is very close to the previous one, collapse so we don't
-    # bloat the buffer with 50+ "M1" entries in one real minute.
-    # Keep at most the true historical + one forming.
-    if len(buffer) >= 2:
-        prev = buffer[-2]
-        curr = buffer[-1]
-        prev_m = _floor_to_minute(prev["timestamp"])
-        curr_m = _floor_to_minute(curr["timestamp"])
-        if (curr_m - prev_m).total_seconds() / 60 <= 1:
-            # Merge curr into prev (or keep only the newest as forming) and drop the duplicate minute
-            _merge_bar(prev, curr, replace_open=True)
-            # pop the last (we merged into prev)
-            buffer.pop()
+        # New minute (or historical older) → append (for live new minute) or upsert for old backfill
+        if bar_minute > last_minute:
+            buffer.append(incoming_bar)
+        else:
+            _upsert_historical_bar(symbol, incoming_bar)
 
 
 def _merge_bar(existing: dict, incoming: dict, replace_open: bool = False) -> None:
