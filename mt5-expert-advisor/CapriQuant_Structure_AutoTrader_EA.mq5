@@ -170,6 +170,7 @@ bool SendBarData(int shift, bool isBackfill)
 
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double spreadPoints = (ask - bid) / _Point;
    string ts = TimeToString(barTime, TIME_DATE | TIME_SECONDS);
    string backfill = isBackfill ? "true" : "false";
 
@@ -177,9 +178,9 @@ bool SendBarData(int shift, bool isBackfill)
       "{\"symbol\":\"%s\",\"timeframe\":\"M1\",\"timestamp\":\"%s\",\"backfill\":%s,"
       "\"bid\":%.5f,\"ask\":%.5f,"
       "\"open\":%.5f,\"high\":%.5f,\"low\":%.5f,\"close\":%.5f,\"volume\":%d,"
-      "\"balance\":%.2f,\"equity\":%.2f}",
+      "\"spread\":%.2f,\"balance\":%.2f,\"equity\":%.2f}",
       currentSymbol, ts, backfill, bid, ask, open, high, low, close, vol,
-      balance, equity);
+      spreadPoints, balance, equity);
 
    string headers = "Content-Type: application/json\r\n";
    uchar post_data[];

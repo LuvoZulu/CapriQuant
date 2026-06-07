@@ -85,8 +85,16 @@ def _compat_init(self, params_or_equity=None, *args, **kwargs):
                if k not in ("initial_equity", "base_risk_pct",
                             "max_risk_pct", "daily_loss_limit_pct")},
         )
-    else:
-        _original_init(self, params_or_equity, *args, **kwargs)
+        return
+    # New-style direct calls:
+    #   RiskManager(123.0)                    -> params_or_equity gets the equity number
+    #   RiskManager(initial_equity=123.0)     -> params_or_equity=None, initial_equity in kwargs
+    #   get_risk_manager() / get_risk_manager(1000.0) both end up here
+    if params_or_equity is not None and "initial_equity" not in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["initial_equity"] = params_or_equity
+    # Call original without injecting a conflicting positional None
+    _original_init(self, **kwargs)
 
 
 RiskManager.__init__ = _compat_init
