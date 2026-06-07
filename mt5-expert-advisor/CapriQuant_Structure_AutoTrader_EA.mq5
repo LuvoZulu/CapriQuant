@@ -200,9 +200,10 @@ string GetStructureSignal(string tf)
 {
    // Send the real current spread (in points) instead of hardcoded 0.0
    double spreadPoints = (SymbolInfoDouble(currentSymbol, SYMBOL_ASK) - SymbolInfoDouble(currentSymbol, SYMBOL_BID)) / _Point;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
 
-   string url = StringFormat("%s/signal/%s/%s?engine=structure&min_candles=8&spread=%.1f",
-                             ServerURL, currentSymbol, tf, spreadPoints);
+   string url = StringFormat("%s/signal/%s/%s?engine=structure&min_candles=8&spread=%.1f&equity=%.2f",
+                             ServerURL, currentSymbol, tf, spreadPoints, equity);
 
    uchar  dummy[];
    uchar  result[];
@@ -236,8 +237,13 @@ void ProcessSignalResponse(string json)
    string setup       = ExtractJsonString(json, "setup");
    string rationale   = ExtractJsonString(json, "rationale");
    double stop        = ExtractJsonDouble(json, "stop_suggestion");
+   double validatedStop = ExtractJsonDouble(json, "validated_stop");
    double tp1         = ExtractJsonDouble(json, "tp1");
    double tp2         = ExtractJsonDouble(json, "tp2");
+   double backendRisk = ExtractJsonDouble(json, "risk_pct");
+
+   if(validatedStop > 0.0)
+      stop = validatedStop;
 
    // Always print the rationale for HOLD signals (very useful for debugging)
    if(signalDir == "HOLD")
@@ -286,7 +292,7 @@ void ProcessSignalResponse(string json)
    }
 
    // === EXECUTE TRADE ===
-   double lots = CalculateLots(stop);
+   double lots = CalculateLots(signalDir, stop, backendRisk);
    if(lots <= 0) return;
 
    ulong ticket = ExecuteTrade(signalDir, lots, stop, tp1, tp2, setup);
@@ -295,7 +301,7 @@ void ProcessSignalResponse(string json)
    {
       tradesToday++;
       Print("[CapriQuant] *** TRADE EXECUTED *** ", signalDir, " | Lots: ", lots, " | Confidence: ", confidence, "%");
-      SendTradeReport(signalDir, lots, stop, tp1, tp2, setup);
+      SendTradeReport(ticket, signalDir, lots, stop, tp1, tp2, setup);
    }
 }
 
@@ -322,14 +328,14 @@ bool HasOpenPosition()
 //+------------------------------------------------------------------+
 //| Calculate lot size based on structural stop distance             |
 //+------------------------------------------------------------------+
-double CalculateLots(double stopPrice)
+double CalculateLots(string direction, double stopPrice, double backendRiskPct)
 {
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double riskMoney = equity * (RiskPercent / 100.0);
+   double effectiveRiskPct = (backendRiskPct > 0.0) ? backendRiskPct : RiskPercent;
+   double riskMoney = equity * (effectiveRiskPct / 100.0);
 
-   double entry = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ?
-                  SymbolInfoDouble(currentSymbol, SYMBOL_ASK) :
-                  SymbolInfoDouble(currentSymbol, SYMBOL_BID);
+   double entry = (direction == "BUY") ? SymbolInfoDouble(currentSymbol, SYMBOL_ASK) :
+                                         SymbolInfoDouble(currentSymbol, SYMBOL_BID);
 
    double stopDist = MathAbs(entry - stopPrice);
    if(stopDist < 0.00001) stopDist = SymbolInfoDouble(currentSymbol, SYMBOL_POINT) * 80;
@@ -428,15 +434,16 @@ double ExtractJsonDouble(string json, string key)
 //+------------------------------------------------------------------+
 //| Report executed trade to backend for UI / historical tracking    |
 //+------------------------------------------------------------------+
-void SendTradeReport(string direction, double lots, double sl, double tp1, double tp2, string setup)
+void SendTradeReport(ulong ticket, string direction, double lots, double sl, double tp1, double tp2, string setup)
 {
    double entry = (direction == "BUY") ? SymbolInfoDouble(currentSymbol, SYMBOL_ASK) :
                                           SymbolInfoDouble(currentSymbol, SYMBOL_BID);
 
    string payload = StringFormat(
       "{\"symbol\":\"%s\",\"direction\":\"%s\",\"entry_price\":%.5f,\"stop_loss\":%.5f,"
-      "\"tp1\":%.5f,\"tp2\":%.5f,\"volume_lots\":%.2f,\"outcome\":\"open\",\"notes\":\"CapriQuant-%s\"}",
-      currentSymbol, direction, entry, sl, tp1, tp2, lots, setup);
+      "\"tp1\":%.5f,\"tp2\":%.5f,\"volume_lots\":%.2f,\"ticket\":%I64u,"
+      "\"outcome\":\"open\",\"setup\":\"%s\",\"notes\":\"CapriQuant-%s\"}",
+      currentSymbol, direction, entry, sl, tp1, tp2, lots, ticket, setup, setup);
 
    string headers = "Content-Type: application/json\r\n";
    uchar post_data[];

@@ -176,6 +176,35 @@ def apply_m5_risk_levels(
     return out
 
 
+def _directional_confluence(
+    direction: str,
+    amd_score: float,
+    fib_score: float,
+    pa_score: float,
+    liq_score: float,
+    crt_score: float,
+    struc_score: float,
+) -> float:
+    """Return positive confluence strength for the requested trade direction."""
+    if direction == "BUY":
+        return (
+            max(0.0, amd_score)
+            + max(0.0, fib_score)
+            + max(0.0, pa_score)
+            + max(0.0, liq_score)
+            + max(0.0, crt_score) * 0.6
+            + max(0.0, struc_score) * 0.4
+        )
+    return (
+        abs(min(0.0, amd_score))
+        + abs(min(0.0, fib_score))
+        + abs(min(0.0, pa_score))
+        + abs(min(0.0, liq_score))
+        + abs(min(0.0, crt_score)) * 0.6
+        + abs(min(0.0, struc_score)) * 0.4
+    )
+
+
 def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
     """
     Revamped philosophy (Long-term reliability + reasonable frequency)
@@ -212,7 +241,16 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
     struc_score = struc_mod.analyze_structure(ms) if hasattr(struc_mod, 'analyze_structure') else 0.0
 
     s = get_settings()
-    total_confluence = amd_score + fib_score + pa_score + liq_score + (crt_score * 0.6) + (struc_score * 0.4)
+    if spread and spread > s.max_spread_for_trade:
+        return []
+
+    bull_confluence = _directional_confluence(
+        "BUY", amd_score, fib_score, pa_score, liq_score, crt_score, struc_score
+    )
+    bear_confluence = _directional_confluence(
+        "SELL", amd_score, fib_score, pa_score, liq_score, crt_score, struc_score
+    )
+    total_confluence = max(bull_confluence, bear_confluence)
 
     # Global quality gate from config
     if total_confluence < s.min_confluence_for_setup:
@@ -220,7 +258,10 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
 
     # Simple volatility regime awareness (helps avoid trading in dead/choppy markets)
     recent_atr = atr
-    avg_atr = sum([ (ms.swings[i].price - ms.swings[i-1].price if i > 0 else 0) for i in range(1, min(8, len(ms.swings))) ]) / max(1, min(7, len(ms.swings)-1)) or atr
+    avg_atr = sum(
+        abs(ms.swings[i].price - ms.swings[i - 1].price)
+        for i in range(1, min(8, len(ms.swings)))
+    ) / max(1, min(7, len(ms.swings) - 1)) or atr
     vol_regime = "high" if recent_atr > avg_atr * 1.15 else "low" if recent_atr < avg_atr * 0.75 else "normal"
 
     # ------------------------------------------------------------------
@@ -240,13 +281,15 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
         )
 
         # Only hard veto if no BOS + very weak confluence (adjusted with lower overall min_confluence)
-        if not has_supporting_bos and total_confluence < 0.50:
+        direction_confluence = bull_confluence if direction == "BUY" else bear_confluence
+
+        if not has_supporting_bos and direction_confluence < 0.50:
             return "No recent BOS + weak confluence"
 
         # Respect HTF bias (Option C) but not as absolute (adjusted)
-        if ms.bias == "BEARISH" and direction == "BUY" and total_confluence < 0.90:
+        if ms.bias == "BEARISH" and direction == "BUY" and direction_confluence < 0.90:
             return "Against bearish market structure"
-        if ms.bias == "BULLISH" and direction == "SELL" and total_confluence < 0.90:
+        if ms.bias == "BULLISH" and direction == "SELL" and direction_confluence < 0.90:
             return "Against bullish market structure"
 
         return None
@@ -341,7 +384,7 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
     # ------------------------------------------------------------------
     # NEW SETUP 3: Trend Continuation (to avoid missing strong moves)
     # ------------------------------------------------------------------
-    if ms.bias == "BULLISH" and total_confluence > 0.45:
+    if ms.bias == "BULLISH" and bull_confluence > 0.45:
         # Price has made higher highs/lows and is pulling back to minor structure
         has_bull_bos = any(b.break_type == "BOS" and b.direction == "BULL" for b in ms.breaks[-4:])
         minor_pullback = any(abs(price - ob.high) < atr * 0.6 for ob in ms.order_blocks if ob.ob_type == "BULLISH" and not ob.is_mitigated)
@@ -362,7 +405,7 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
                     veto_reason=veto,
                 ))
 
-    if ms.bias == "BEARISH" and total_confluence > 0.45:
+    if ms.bias == "BEARISH" and bear_confluence > 0.45:
         has_bear_bos = any(b.break_type == "BOS" and b.direction == "BEAR" for b in ms.breaks[-4:])
         minor_pullback = any(abs(price - ob.low) < atr * 0.6 for ob in ms.order_blocks if ob.ob_type == "BEARISH" and not ob.is_mitigated)
 
@@ -493,7 +536,10 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
         atr=getattr(ms, "atr", 0),
     )
     struc_score = struc_mod.analyze_structure(ms) if hasattr(struc_mod, 'analyze_structure') else 0.0
-    total_confluence = amd_score + fib_score + pa_score + liq_score + (crt_score * 0.6) + (struc_score * 0.4)
+    total_confluence = _directional_confluence(
+        best.direction, amd_score, fib_score, pa_score, liq_score, crt_score, struc_score
+    )
+    raw_confluence = amd_score + fib_score + pa_score + liq_score + (crt_score * 0.6) + (struc_score * 0.4)
 
     result = {
         "signal": best.direction,
@@ -518,6 +564,7 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
             "crt": round(crt_score, 3),
             "structure": round(struc_score, 3),
             "total": round(total_confluence, 3),
+            "raw_signed_total": round(raw_confluence, 3),
         },
         "market_structure": ms.to_dict(),
         "all_setups": [

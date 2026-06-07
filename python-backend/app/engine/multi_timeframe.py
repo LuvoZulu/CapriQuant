@@ -198,11 +198,11 @@ def get_mtf_structure_signal(
         df_m15 = df_m15.iloc[:-1].reset_index(drop=True)
 
     ms_m5 = None
-    if len(df_m5) >= 3:
-        ms_m5 = compute_structure(df_m5, symbol=symbol, timeframe="M5", min_candles=30)
+    if len(df_m5) >= 5:
+        ms_m5 = compute_structure(df_m5, symbol=symbol, timeframe="M5", min_candles=min(30, len(df_m5)))
         ms_m5.current_price = current_price
 
-    if len(df_m5) < 3 or len(df_m15) < 2 or ms_m5 is None:
+    if len(df_m5) < 5 or len(df_m15) < 5 or ms_m5 is None:
         return {
             "signal": "HOLD",
             "score": 0.0,
@@ -216,7 +216,7 @@ def get_mtf_structure_signal(
         }
 
     ms_m1 = compute_structure(df_m1, symbol=symbol, timeframe="M1", min_candles=min_candles_m1)
-    ms_m15 = compute_structure(df_m15, symbol=symbol, timeframe="M15", min_candles=20)
+    ms_m15 = compute_structure(df_m15, symbol=symbol, timeframe="M15", min_candles=min(20, len(df_m15)))
 
     for ms in (ms_m1, ms_m5, ms_m15):
         ms.current_price = current_price

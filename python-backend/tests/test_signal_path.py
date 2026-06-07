@@ -52,3 +52,43 @@ def test_mtf_small_buffer_graceful():
     assert sig["signal"] in ("HOLD", "BUY", "SELL")
     # MTF signature now accepts equity for risk veto (default 0 -> 200)
     # (full buffer-dependent test would be integration)
+
+
+def test_bearish_context_scores_count_as_sell_confluence():
+    from app.engine.confluence import _directional_confluence
+
+    strength = _directional_confluence(
+        "SELL",
+        amd_score=-0.5,
+        fib_score=-0.4,
+        pa_score=-0.3,
+        liq_score=-0.2,
+        crt_score=-0.1,
+        struc_score=-0.6,
+    )
+
+    assert strength > 0.48
+
+
+def test_mtf_waits_for_completed_higher_timeframe_history():
+    from app.engine.multi_timeframe import get_mtf_structure_signal
+    from app.live_data import clear_buffer, seed_buffer
+
+    clear_buffer("MTFWAIT")
+    start = datetime.utcnow() - timedelta(minutes=24)
+    bars = []
+    for i in range(24):
+        price = 100 + i * 0.1
+        bars.append({
+            "timestamp": start + timedelta(minutes=i),
+            "open": price,
+            "high": price + 0.2,
+            "low": price - 0.2,
+            "close": price + 0.05,
+            "volume": 10,
+        })
+    seed_buffer("MTFWAIT", bars, merge=False)
+
+    sig = get_mtf_structure_signal("MTFWAIT", min_candles_m1=8)
+    assert sig["signal"] == "HOLD"
+    assert "Building" in sig["rationale"]
