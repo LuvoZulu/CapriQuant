@@ -153,7 +153,7 @@ def get_current_structure(symbol: str):
     try:
         from app.engine.multi_timeframe import get_mtf_structure_signal
         res = get_mtf_structure_signal(
-            normalized, spread=0.0, min_candles_m1=5, equity=0.0
+            normalized, account_equity=0.0, spread=0.0
         ) or {}
         if isinstance(res, dict):
             bias = res.get("bias") or bias
