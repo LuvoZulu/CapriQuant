@@ -89,6 +89,6 @@ def test_mtf_waits_for_completed_higher_timeframe_history():
         })
     seed_buffer("MTFWAIT", bars, merge=False)
 
-    sig = get_mtf_structure_signal("MTFWAIT", min_candles_m1=8)
+    sig = get_mtf_structure_signal("MTFWAIT", account_equity=1000.0)
     assert sig["signal"] == "HOLD"
     assert "Building" in sig["rationale"]
