@@ -183,8 +183,12 @@ def add_market_data(symbol: str, data: dict) -> None:
 
     bar_minute = _floor_to_minute(ts)
 
-    # Reject stale historical bars (EA backfill mistakes or old DB replay)
-    if not is_within_catchup_window(bar_minute):
+    is_backfill = data.get("backfill") in (True, "true", 1, "1", "True")
+
+    # Reject stale historical bars (EA backfill mistakes or old DB replay).
+    # But *always* accept explicit backfill from the EA (its startup history seed).
+    # The catchup filter is applied later for structure decisions.
+    if not is_backfill and not is_within_catchup_window(bar_minute):
         return
 
     incoming_bar = {

@@ -300,16 +300,21 @@ def market_data(data: dict, background_tasks: BackgroundTasks) -> Dict:  # noqa:
         data.get("close"), data.get("bid"), data.get("ask"), data.get("volume"),
     )
 
-    # ── Historical catch-up guard ────────────────────────────────────────
+    # ── Update live buffer (always, for both live and backfill).
+    # Backfill from EA is the explicit startup seed of recent M1 history.
+    # We want it in the buffer so candles_available and structure see the bars quickly.
+    # The catchup window / stale filter protects *decisions*, not buffer population.
+    # ── Update live buffer ───────────────────────────────────────────────
+    update_live_bar(symbol, data)
+
+    # ── Historical catch-up guard for decisions (after buffering) ────────
     if is_backfill:
         from app.live_data import is_within_catchup_window, to_naive_utc
         ts_raw = data.get("timestamp")
         if ts_raw is not None and not is_within_catchup_window(to_naive_utc(ts_raw)):
-            logger.info("[BACKFILL %s] skipped stale bar for %s", req_id, symbol)
-            return {"status": "backfill_skipped", "symbol": symbol}
-
-    # ── Update live buffer ───────────────────────────────────────────────
-    update_live_bar(symbol, data)
+            logger.info("[BACKFILL %s] buffered but skipped for decisions (stale) for %s", req_id, symbol)
+            _persist_tick_to_db(symbol, timeframe, data, background_tasks)
+            return {"status": "backfill_buffered_skipped_decisions", "symbol": symbol}
 
     # ── Update equity in RiskManager if EA sends it ─────────────────────
     equity = data.get("equity") or data.get("account_equity")
