@@ -70,25 +70,25 @@ def test_bearish_context_scores_count_as_sell_confluence():
     assert strength > 0.48
 
 
-def test_mtf_waits_for_completed_higher_timeframe_history():
+def test_mtf_holds_until_enough_live_bars():
     from app.engine.multi_timeframe import get_mtf_structure_signal
-    from app.live_data import clear_buffer, seed_buffer
+    from app.live_data import clear_buffer, add_market_data, update_ea_config
 
     clear_buffer("MTFWAIT")
-    start = datetime.utcnow() - timedelta(minutes=24)
-    bars = []
-    for i in range(24):
+    update_ea_config("MTFWAIT", {"min_candles_m1": 20})
+    start = datetime.utcnow().replace(second=0, microsecond=0)
+    for i in range(5):
         price = 100 + i * 0.1
-        bars.append({
-            "timestamp": start + timedelta(minutes=i),
+        ts = start + timedelta(minutes=i)
+        add_market_data("MTFWAIT", {
+            "timestamp": ts,
             "open": price,
             "high": price + 0.2,
             "low": price - 0.2,
             "close": price + 0.05,
             "volume": 10,
         })
-    seed_buffer("MTFWAIT", bars, merge=False)
 
-    sig = get_mtf_structure_signal("MTFWAIT", min_candles_m1=8)
+    sig = get_mtf_structure_signal("MTFWAIT")
     assert sig["signal"] == "HOLD"
-    assert "Building" in sig["rationale"]
+    assert "insufficient" in sig.get("hold_reason", "").lower()

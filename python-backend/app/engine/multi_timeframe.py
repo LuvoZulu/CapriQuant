@@ -31,7 +31,12 @@ from app.engine.confluence import (
     generate_structure_summary,
     apply_m5_risk_levels,
 )
-from app.live_data import live_buffer, resample_ohlcv, filter_df_to_catchup_window, MAX_COMPLETED_BARS
+from app.live_data import (
+    get_recent_closed_df,
+    get_min_candles_m1,
+    get_max_bars,
+    resample_ohlcv,
+)
 from app.config import get_settings
 from app.risk.risk_manager import get_risk_manager, TradeRecord
 
@@ -90,21 +95,14 @@ def get_mtf_structure_signal(
     """
     s = get_settings()
 
-    # ── 1. Fetch buffers ─────────────────────────────────────────────────
-    m1_buf = live_buffer(symbol, "M1")
-    if m1_buf is None or len(m1_buf) < 10:
-        return _hold(symbol, "insufficient_m1_buffer")
+    # ── 1. Fetch live buffers (accumulated since EA attach) ─────────────
+    min_m1 = get_min_candles_m1(symbol)
+    completed_m1 = get_recent_closed_df(symbol, limit=get_max_bars(symbol))
+    if completed_m1 is None or len(completed_m1) < min_m1:
+        return _hold(symbol, f"insufficient_m1_buffer({len(completed_m1) if completed_m1 is not None else 0})")
 
-    m1_df_raw = pd.DataFrame(list(m1_buf))
-    m1_df = filter_df_to_catchup_window(m1_df_raw)
-    if m1_df is None or m1_df.empty:
-        return _hold(symbol, "m1_catchup_filtered")
-
-    # Use completed bars only for structure analysis (last bar is forming)
-    completed_m1 = m1_df.iloc[:-1] if len(m1_df) > 1 else m1_df
-
-    m5_df = resample_ohlcv(completed_m1, "5min")
-    m15_df = resample_ohlcv(completed_m1, "15min")
+    m5_df = resample_ohlcv(completed_m1, minutes=5)
+    m15_df = resample_ohlcv(completed_m1, minutes=15)
 
     min_m5 = 15
     min_m15 = 5
@@ -187,6 +185,24 @@ def get_mtf_structure_signal(
     if crt_levels:
         m5_signal["crt_levels"] = crt_levels
 
+    # ── Rich CRT from crt_strategy.py now contributes directly to confluence score ──
+    # This ensures the full CRTStrategy (raids, EQ bounces, expansions, HTF bias)
+    # affects the confluence number used for risk sizing and reporting.
+    # (The core get_structure_signal no longer uses the deprecated crt.py)
+    rich_crt_score = 0.0
+    if crt_setups:
+        matching = [s for s in crt_setups if s.direction == direction]
+        if matching:
+            rich_crt_score = max(s.confidence for s in matching)
+    # Blend rich CRT into the confluence that came from base (which now has crt=0)
+    base_confluence = float(m5_signal.get("confluence", 0) or 0)
+    enhanced_confluence = min(1.0, base_confluence + rich_crt_score * 0.35)
+    m5_signal["confluence"] = round(enhanced_confluence, 3)
+    if "contextual_scores" not in m5_signal:
+        m5_signal["contextual_scores"] = {}
+    m5_signal["contextual_scores"]["crt"] = round(rich_crt_score, 3)
+    m5_signal["contextual_scores"]["crt_strategy"] = True  # marker that rich crt_strategy was used
+
     # ── 7. M1 entry confirmation ─────────────────────────────────────────
     ms_m1 = compute_structure(completed_m1.tail(60), symbol=symbol) if len(completed_m1) >= 15 else None
     if ms_m1 is not None:
@@ -208,12 +224,19 @@ def get_mtf_structure_signal(
     signal_with_levels = apply_m5_risk_levels(m5_signal, ms_m5, entry_price=price)
 
     # ── 9. RiskManager circuit check ────────────────────────────────────
+    # Now modulated by rich CRT (from crt_strategy) + AMD conviction (from session_amd)
+    # for the most effective use of these in the overall confluence/quality passed to risk.
     equity = account_equity or account_balance or 1000.0
     rm = get_risk_manager(initial_equity=equity)
     if account_equity:
         rm.update_equity(account_equity)
 
     confluence_score = float(m5_signal.get("confluence", 0))
+    # Modulate with rich AMD conviction (session_amd.py) — if we reached here the phase was tradeable,
+    # but lower conviction still de-risks via quality input to RiskManager.
+    if amd_result is not None:
+        amd_conv = max(0.6, getattr(amd_result, 'conviction', 1.0))
+        confluence_score = min(1.0, confluence_score * amd_conv)
     risk_pct = rm.get_risk_pct(setup_quality=min(1.0, confluence_score))
     if risk_pct is None:
         return _hold(symbol, f"risk_manager_halt:{rm.state.halt_reason}")

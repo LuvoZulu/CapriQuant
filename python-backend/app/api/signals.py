@@ -44,12 +44,10 @@ def normalize_symbol(symbol: str) -> str:
 def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min_candles_override: int = None) -> pd.DataFrame:
     normalized_symbol = normalize_symbol(symbol)
 
-    max_hours = float(get_settings().catchup_max_hours)
     query = """
         SELECT timestamp, open, high, low, close, tick_volume as volume
         FROM market_data
         WHERE symbol = %s AND timeframe = %s
-          AND timestamp >= NOW() - (%s * INTERVAL '1 hour')
         ORDER BY timestamp DESC
         LIMIT %s
     """
@@ -57,12 +55,12 @@ def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min
     from app.db import db_cursor
     try:
         with db_cursor() as (c, cur):
-            cur.execute(query, (normalized_symbol, timeframe, max_hours, CANDLE_LIMIT))
+            cur.execute(query, (normalized_symbol, timeframe, CANDLE_LIMIT))
             rows = cur.fetchall()
     except Exception:
         # legacy fallback
         cursor = conn.cursor()
-        cursor.execute(query, (normalized_symbol, timeframe, max_hours, CANDLE_LIMIT))
+        cursor.execute(query, (normalized_symbol, timeframe, CANDLE_LIMIT))
         rows = cursor.fetchall()
         cursor.close()
 
@@ -91,9 +89,7 @@ def fetch_candles(conn, symbol: str, timeframe: str, engine: str = "legacy", min
 
 @router.get("/debug/data-count")
 def get_data_count(symbol: str = None, timeframe: str = None):
-    """Debug endpoint to see how much LIVE market data (from EA / market, NOT DB) is in the rolling buffer.
-    Directly from the market via live buffers (1 day / 1440 M1 max now).
-    """
+    """Debug endpoint — live M1 buffer counts (EA stream only, no historical backfill)."""
     from app.live_data import get_buffer_status, get_all_buffer_lengths, list_tracked_symbols, get_recent_df
     try:
         if symbol:
@@ -107,7 +103,7 @@ def get_data_count(symbol: str = None, timeframe: str = None):
                 "candle_count": count,
                 "ready_for_default_structure": count >= 30,
                 "ready_for_min_8 (what your EA uses)": count >= 8,
-                "note": "Data directly from live market buffer (EA payloads), not DB. Buffer: 1 week +4d headroom (15840) before rewrite. Post-off: only 1440 for trend. No 8k+.",
+                "note": "Live stream only — buffer grows from EA attach; cap from EA buffer_max_m1.",
                 "buffer_status": status,
                 "source": "live_market_buffer"
             }
@@ -117,9 +113,8 @@ def get_data_count(symbol: str = None, timeframe: str = None):
             return {
                 "all_live_market_buffers": lengths,
                 "tracked": tracked,
-                "note": "Live M1 counts from market buffer (1w +4d headroom=15840 before rewrite). Post-off initial 1440 for trend.",
-                "max_per_day": 1440,
-                "full_buffer": 15840,
+                "note": "Live M1 counts from in-memory buffer (EA-driven cap).",
+                "default_buffer_cap": get_settings().default_buffer_max_m1,
                 "source": "live_market_buffer"
             }
     except Exception as e:
@@ -224,13 +219,13 @@ def get_trading_signal(
     # === Graceful insufficient-data handling (eliminates 400 spam) ===
     # Very common when data-feeder EAs and signal consumers start at the same time.
     # Return clean 200 + HOLD instead of hard 400.
-    default_min = 15 if engine == "structure" else MIN_CANDLES_FOR_SIGNAL   # lowered from 30 for live data bootstrapping
-    min_required = min_candles if min_candles is not None else default_min
+    from app.live_data import get_buffer_status, get_min_candles_m1
+    min_required = min_candles if min_candles is not None else get_min_candles_m1(normalized)
+    if engine != "structure":
+        min_required = max(min_required, MIN_CANDLES_FOR_SIGNAL)
     min_required = max(min_required, 5)
 
-    # Get candles_available DIRECTLY FROM THE MARKET (live buffer), not DB.
-    # This is the rolling 1-day market data fed by EA.
-    from app.live_data import get_buffer_status
+    # Live buffer only — no DB / historical fallback
     candles_available = 0
     try:
         buf_status = get_buffer_status(normalized)
@@ -274,19 +269,31 @@ def get_trading_signal(
     from app.live_data import get_recent_df_for_structure, get_latest_price
     live_df = get_recent_df_for_structure(normalized, limit=200)
 
-    if live_df is not None and len(live_df) >= 6:
-        df = live_df
-        # Force the absolute latest price into the last bar for freshest decisions (analysis used closed)
-        live_price = get_latest_price(normalized)
-        if live_price and len(df) > 0:
-            df.loc[df.index[-1], 'close'] = live_price['close']
-            if 'high' in df.columns:
-                df.loc[df.index[-1], 'high'] = max(df.loc[df.index[-1], 'high'], live_price['close'])
-            if 'low' in df.columns:
-                df.loc[df.index[-1], 'low'] = min(df.loc[df.index[-1], 'low'], live_price['close'])
-    else:
-        # Only fall back to DB if we truly have almost nothing in the live buffer
-        df = fetch_candles(conn, symbol, tf_upper, engine=engine, min_candles_override=min_candles)
+    if live_df is None or len(live_df) < min_required:
+        friendly = {
+            "signal": "HOLD",
+            "score": 0.0,
+            "confidence": 0.0,
+            "engine": engine,
+            "setup": None,
+            "rationale": (
+                f"Insufficient live market data for {normalized}. "
+                f"Only {candles_available} M1 bars since EA attach (need ≥ {min_required})."
+            ),
+            "candles_available": candles_available,
+            "min_required": min_required,
+        }
+        response_body = {"symbol": normalized, "timeframe": tf_upper, "engine": engine, **friendly}
+        return _apply_system_mode_to_signal(response_body)
+
+    df = live_df
+    live_price = get_latest_price(normalized)
+    if live_price and len(df) > 0:
+        df.loc[df.index[-1], 'close'] = live_price['close']
+        if 'high' in df.columns:
+            df.loc[df.index[-1], 'high'] = max(df.loc[df.index[-1], 'high'], live_price['close'])
+        if 'low' in df.columns:
+            df.loc[df.index[-1], 'low'] = min(df.loc[df.index[-1], 'low'], live_price['close'])
 
     if engine in ("structure", "mtf", "structure_mtf"):
         # Default "structure" now prefers full MTF production path (M5 primary + M1 confirm + M15 veto) for best accuracy.

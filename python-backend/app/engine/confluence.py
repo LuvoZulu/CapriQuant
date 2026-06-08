@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from app.features.structure import MarketStructure, OrderBlock
 
 # Import the fully rewritten contextual analyzers
-from app.strategies import amd, fibonacci, price_action, liquidity, crt, structure as struc_mod
+from app.strategies import amd, fibonacci, price_action, liquidity, structure as struc_mod
+# Note: old crt.py is deliberately not used. Rich CRT comes from crt_strategy.py via MTF pipeline.
 from app.config import get_settings
 
 
@@ -231,13 +232,9 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
     fib_score = fibonacci.analyze_fib_confluence(ms)
     pa_score = price_action.analyze_price_action_contextual(ms)
     liq_score = liquidity.analyze_liquidity_sweeps(ms)
-    crt_score = crt.analyze_crt_range_confluence(
-        df=None,
-        market_structure=ms,
-        recent_displacement=getattr(ms, "recent_displacement", None),
-        bias=getattr(ms, "bias", "NEUTRAL"),
-        atr=getattr(ms, "atr", 0),
-    )
+    # CRT from old crt.py removed per requirement. Rich CRT logic from crt_strategy.py
+    # is injected in the MTF path (multi_timeframe.py) and contributes to final confluence.
+    crt_score = 0.0
     struc_score = struc_mod.analyze_structure(ms) if hasattr(struc_mod, 'analyze_structure') else 0.0
 
     s = get_settings()
@@ -528,13 +525,9 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
     fib_score = fibonacci.analyze_fib_confluence(ms)
     pa_score = price_action.analyze_price_action_contextual(ms)
     liq_score = liquidity.analyze_liquidity_sweeps(ms)
-    crt_score = crt.analyze_crt_range_confluence(
-        df=None,
-        market_structure=ms,
-        recent_displacement=getattr(ms, "recent_displacement", None),
-        bias=getattr(ms, "bias", "NEUTRAL"),
-        atr=getattr(ms, "atr", 0),
-    )
+    # CRT from old crt.py removed per requirement. Rich CRT logic from crt_strategy.py
+    # is injected in the MTF path (multi_timeframe.py) and contributes to final confluence.
+    crt_score = 0.0
     struc_score = struc_mod.analyze_structure(ms) if hasattr(struc_mod, 'analyze_structure') else 0.0
     total_confluence = _directional_confluence(
         best.direction, amd_score, fib_score, pa_score, liq_score, crt_score, struc_score

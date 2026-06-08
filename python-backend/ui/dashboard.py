@@ -778,7 +778,7 @@ with st.sidebar:
     <div class="cq-card" style="padding:10px 12px;">
       <div class="stat-row">
         <span class="stat-lbl">Equity</span>
-        <span class="stat-val">${equity:,.2f}</span>
+        <span class="stat-val">R{equity:,.2f}</span>
       </div>
       <div class="stat-row">
         <span class="stat-lbl">Daily PnL</span>
@@ -875,14 +875,14 @@ with tab_overview:
     kpi1.metric("Backend",       "LIVE ✅" if backend_alive else "DOWN ❌")
     kpi2.metric("M1 Buffer Cap", f"{status.get('buffer_max_m1', 15840):,}")
     kpi3.metric("Symbols",       len(tracked))
-    kpi4.metric("Equity",        f"${risk.get('equity', 0):,.0f}")
+    kpi4.metric("Equity",        f"R{risk.get('equity', 0):,.0f}")
     kpi5.metric("Daily PnL",     f"{risk.get('daily_pnl_pct', 0):+.2f}%")
     kpi6.metric("Last Tick",     utc_now.strftime("%H:%M:%S"))
 
     st.caption(
         f"Tracked: **{', '.join(tracked) if tracked else 'none yet'}** &nbsp;·&nbsp; "
-        f"Buffer: 1w+4d headroom (15840 M1) &nbsp;·&nbsp; "
-        f"Post-off: last 1440 M1 for trend/structure &nbsp;·&nbsp; M5 primary for decisions"
+        f"Live M1 accumulation (realtime ticks from EA) &nbsp;·&nbsp; "
+        f"Readiness based on M1 count (37 M1 = strong) &nbsp;·&nbsp; M5 derived for MTF"
     )
 
     # ── Symbol Cards ─────────────────────────────────────────────────────────
@@ -893,20 +893,24 @@ with tab_overview:
         snap = fetch_current(sym)
         with card_cols[i]:
             buf  = snap.get("buffer", {}) if isinstance(snap, dict) else {}
-            m5c  = buf.get("m5_bars_in_buffer", 0)
-            m5mx = buf.get("max_m5_bars", 3168)
-            m5p  = buf.get("m5_pct_full", 0)
+            m1c   = buf.get("bars_in_buffer", 0) or buf.get("effective_bars", 0)
+            m5c   = buf.get("m5_bars_in_buffer", 0)
+            m5mx  = buf.get("max_m5_bars", 3168)
+            m5p   = buf.get("m5_pct_full", 0)
+            ticks = buf.get("ticks_received", 0)
 
-            if m5c < 3:
+            # Readiness now primarily based on M1 live accumulation (new live_data design).
+            # With 37 M1 we should no longer be "insufficient". M5 is derived/secondary for MTF.
+            if m1c < 5:
                 readiness, r_icon, r_color = "INSUFFICIENT", "🔴", "var(--red)"
-            elif m5c < 8:
+            elif m1c < 15:
                 readiness, r_icon, r_color = "BASIC",        "🟡", "var(--yellow)"
-            elif m5c < 20:
+            elif m1c < 30:
                 readiness, r_icon, r_color = "GOOD",         "🟢", "var(--accent)"
             else:
                 readiness, r_icon, r_color = "STRONG",       "✅", "var(--green)"
 
-            insufficient = "error" in snap or snap.get("status") == "insufficient_live_data"
+            insufficient = "error" in snap or snap.get("status") == "insufficient_live_data" or m1c < 5
             bias  = "N/A" if insufficient else snap.get("bias", "?")
             price = snap.get("current_price")
 
@@ -940,7 +944,7 @@ with tab_overview:
             pct_m5  = min(m5p / 100, 1.0)
             st.progress(pct_m1, text=f"M1: {bcount} bars ({buf.get('pct_full',0):.0f}%)")
             st.progress(pct_m5, text=f"M5: {m5c}/{m5mx} ({m5p:.0f}%)")
-            st.caption("M5 ≥ 20 = full context for high-quality setups")
+            st.caption(f"M1 live accumulation (ticks={ticks}). M1 ≥15 for basic structure; M5 for MTF confirmation. With 37 M1 the card now shows strong readiness (M5 ~{m5c}).")
 
     # ── Signal Engine Summary ─────────────────────────────────────────────────
     st.markdown('<div class="cq-section" style="margin-top:20px;">Signal Engine Activity (cumulative since restart)</div>', unsafe_allow_html=True)
@@ -1045,7 +1049,7 @@ with tab_risk:
     qal = risk_full.get("quality_issues", {})
 
     rm1, rm2, rm3, rm4 = st.columns(4)
-    rm1.metric("Equity",      f"${rm.get('equity', 0):,.2f}")
+    rm1.metric("Equity",      f"R{rm.get('equity', 0):,.2f}")
     rm2.metric("Daily PnL",   f"{rm.get('daily_pnl_pct', 0):+.3f}%")
     rm3.metric("Loss Streak", rm.get("loss_streak", 0))
     rm4.metric("RM Halted",   "YES ⚠️" if rm.get("is_halted") else "NO ✅")

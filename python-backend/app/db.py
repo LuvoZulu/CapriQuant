@@ -256,6 +256,23 @@ def ensure_live_tables():
         "CREATE INDEX IF NOT EXISTS idx_exec_fills_sym_ts ON execution_fills (symbol, ts DESC);",
         "CREATE INDEX IF NOT EXISTS idx_exec_fills_cid ON execution_fills (cid);",
         "CREATE INDEX IF NOT EXISTS idx_exec_fills_ticket ON execution_fills (ticket);",
+        # market_data table for tick archival (used by _do_persist). Must have a
+        # unique constraint so ON CONFLICT works and we avoid duplicate spam.
+        """
+        CREATE TABLE IF NOT EXISTS market_data (
+            id BIGSERIAL PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            timestamp TIMESTAMPTZ NOT NULL,
+            open DOUBLE PRECISION,
+            high DOUBLE PRECISION,
+            low DOUBLE PRECISION,
+            close DOUBLE PRECISION,
+            tick_volume DOUBLE PRECISION,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_market_data_sym_ts ON market_data (symbol, timestamp DESC);",
     ]
 
     extra_cols = [
@@ -278,6 +295,17 @@ def ensure_live_tables():
                     )
                 except Exception:
                     pass
+
+            # Create market_data unique constraint (best effort - safe on old PG or if dups exist)
+            try:
+                cur.execute("""
+                    ALTER TABLE market_data
+                    ADD CONSTRAINT IF NOT EXISTS uq_market_data_sym_tf_ts
+                    UNIQUE (symbol, timeframe, timestamp);
+                """)
+            except Exception:
+                pass
+
             c.commit()
         _live_tables_ready = True
         logger.info("[DB] Live tables ensured (including execution_fills).")

@@ -1,0 +1,12 @@
+{
+  "equity": 200.0,
+  "peak_equity": 1000.0,
+  "daily_start_equity": 1000.0,
+  "week_start_equity": 1000.0,
+  "month_start_equity": 1000.0,
+  "daily_date": "2026-06-08",
+  "loss_streak": 0,
+  "win_streak": 0,
+  "trades_today": 0,
+  "pnl_today_pct": 0.0
+}

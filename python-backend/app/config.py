@@ -49,10 +49,9 @@ class Settings:
     # Data quality
     max_spread_for_trade: float = 400.0  # points
 
-    # Catch-up / rollback after downtime: never use bars older than this for live trend/signals
-    # HARD limit: 1 day max. After system off, trend/structure checks only last 24h — no far historical rollback.
-    catchup_max_hours: float = 24.0
-    catchup_max_m1_bars: int = 24 * 60  # 1440 — hard cap aligned with 1 day of M1
+    # Live-stream defaults (overridden per symbol by EA payload on each /market-data post)
+    default_buffer_max_m1: int = 15840
+    default_min_candles_m1: int = 8
 
     # System
     backend_port: int = 8001
@@ -68,14 +67,9 @@ class Settings:
             self.symbols = [s.strip().upper() for s in syms.split(",") if s.strip()]
         self.default_spread_points = float(os.getenv("CAPRI_SPREAD_POINTS", self.default_spread_points))
         self.management_enabled = os.getenv("CAPRI_MANAGEMENT_ENABLED", "true").lower() == "true"
-        self.catchup_max_hours = float(os.getenv("CAPRI_CATCHUP_MAX_HOURS", self.catchup_max_hours))
-        self.catchup_max_m1_bars = int(os.getenv("CAPRI_CATCHUP_MAX_M1_BARS", self.catchup_max_m1_bars))
+        self.default_buffer_max_m1 = int(os.getenv("CAPRI_DEFAULT_BUFFER_MAX_M1", self.default_buffer_max_m1))
+        self.default_min_candles_m1 = int(os.getenv("CAPRI_DEFAULT_MIN_CANDLES_M1", self.default_min_candles_m1))
         self.risk_daily_pnl_proxy_pct = float(os.getenv("CAPRI_RISK_DAILY_PROXY_PCT", self.risk_daily_pnl_proxy_pct))
-        # Enforce strict 1-day limit for rollback/trend checks after downtime (user requirement: no going far back)
-        if self.catchup_max_hours > 24.0:
-            self.catchup_max_hours = 24.0
-        if self.catchup_max_m1_bars > 24 * 60:
-            self.catchup_max_m1_bars = 24 * 60
 
 # Global instance
 settings = Settings()

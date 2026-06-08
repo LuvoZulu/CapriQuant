@@ -1,17 +1,19 @@
 """Regression tests for execution + signal path fixes."""
 
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import pandas as pd
 
 from app.live_data import (
+    TICK_STATS,
     add_market_data,
-    catchup_cutoff,
     clear_buffer,
-    filter_df_to_catchup_window,
+    get_buffer_length,
+    get_ea_config,
     get_recent_df,
-    is_within_catchup_window,
     to_naive_utc,
+    update_ea_config,
 )
 from app.api.signals import _resolve_validated_stop
 
@@ -36,54 +38,12 @@ def test_validated_stop_never_uses_current_price():
     assert _resolve_validated_stop(sig2) is None
 
 
-def test_catchup_window_filters_old_bars():
-    now = datetime.utcnow()
-    old = now - timedelta(hours=48)
-    df = pd.DataFrame([
-        {"timestamp": old, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 1},
-        {"timestamp": now - timedelta(hours=1), "open": 2, "high": 3, "low": 1.5, "close": 2.5, "volume": 1},
-    ])
-    out = filter_df_to_catchup_window(df)
-    assert len(out) == 1
-    assert is_within_catchup_window(now - timedelta(hours=1))
-    assert not is_within_catchup_window(old)
-    assert catchup_cutoff() <= now - timedelta(hours=23, minutes=59)
-
-
-def test_backfill_upserts_older_bars_without_time_travel():
-    clear_buffer("TEST")
-    now = datetime.utcnow().replace(second=0, microsecond=0)
-
-    add_market_data("TEST", {
-        "timestamp": now,
-        "open": 100,
-        "high": 101,
-        "low": 99,
-        "close": 100.5,
-        "volume": 10,
-    })
-    add_market_data("TEST", {
-        "timestamp": now - timedelta(minutes=2),
-        "open": 98,
-        "high": 99,
-        "low": 97,
-        "close": 98.5,
-        "volume": 7,
-        "backfill": True,
-    })
-    add_market_data("TEST", {
-        "timestamp": now - timedelta(minutes=1),
-        "open": 99,
-        "high": 100,
-        "low": 98,
-        "close": 99.5,
-        "volume": 8,
-        "backfill": True,
-    })
-
-    df = get_recent_df("TEST")
-    assert list(df["timestamp"]) == sorted(df["timestamp"])
-    assert list(df["close"]) == [98.5, 99.5, 100.5]
+def test_ea_config_from_payload():
+    clear_buffer("CFG")
+    update_ea_config("CFG", {"buffer_max_m1": 5000, "min_candles_m1": 12})
+    cfg = get_ea_config("CFG")
+    assert cfg["buffer_max_m1"] == 5000
+    assert cfg["min_candles_m1"] == 12
 
 
 def test_duplicate_live_minute_does_not_add_cumulative_volume():
@@ -112,3 +72,42 @@ def test_duplicate_live_minute_does_not_add_cumulative_volume():
     assert df.iloc[0]["volume"] == 12
     assert df.iloc[0]["high"] == 102
     assert df.iloc[0]["low"] == 98
+
+
+def test_frozen_broker_timestamp_advances_on_utc():
+    clear_buffer("FROZEN")
+    frozen_broker = datetime(2026, 6, 8, 10, 0, 0)
+    start_utc = datetime(2026, 6, 8, 12, 0, 0)
+
+    for minute in range(20):
+        utc_minute = start_utc + timedelta(minutes=minute)
+        with patch("app.live_data._utc_now_minute", return_value=utc_minute):
+            add_market_data("FROZEN", {
+                "timestamp": frozen_broker,
+                "open": 100 + minute * 0.01,
+                "high": 101 + minute * 0.01,
+                "low": 99 + minute * 0.01,
+                "close": 100.5 + minute * 0.01,
+                "volume": 10 + minute,
+            })
+
+    assert get_buffer_length("FROZEN") == 20
+    assert TICK_STATS.get("FROZEN", 0) == 20
+
+
+def test_broker_minute_advance_appends_normally():
+    clear_buffer("LIVE")
+    start = datetime(2026, 6, 8, 14, 0, 0)
+
+    for minute in range(10):
+        ts = start + timedelta(minutes=minute)
+        add_market_data("LIVE", {
+            "timestamp": ts,
+            "open": 100 + minute,
+            "high": 101 + minute,
+            "low": 99 + minute,
+            "close": 100.5 + minute,
+            "volume": 10 + minute,
+        })
+
+    assert get_buffer_length("LIVE") == 10

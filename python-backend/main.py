@@ -19,7 +19,7 @@ import logging
 import json
 import uuid
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -73,6 +73,10 @@ _metrics: Dict[str, Any] = {
 recent_signals_list: list = []
 closed_trades_list: list = []
 
+# Throttle heavy MTF/lifecycle work so /market-data stays fast under load.
+_mtf_cache: Dict[str, Dict[str, Any]] = {}
+MTF_MIN_INTERVAL_SEC = 1.0
+
 
 def normalize_symbol(symbol: str) -> str:
     return _normalize_symbol(symbol)
@@ -85,6 +89,44 @@ def _record_signal(sig: str) -> None:
 
 def _record_risk_veto(reason: str) -> None:
     _metrics["risk_vetoes_total"][reason] = _metrics["risk_vetoes_total"].get(reason, 0) + 1
+
+
+def _current_bar_minute(symbol: str) -> datetime:
+    """Minute bucket of the last buffered bar (after ingest)."""
+    from app.live_data import LIVE_BARS, _floor_to_minute, _resolve_buffer_key
+
+    sym = _resolve_buffer_key(symbol)
+    buf = LIVE_BARS.get(sym)
+    if buf:
+        return _floor_to_minute(buf[-1]["timestamp"])
+    return _floor_to_minute(datetime.utcnow())
+
+
+def _should_compute_mtf(symbol: str, bar_minute: datetime) -> bool:
+    cached = _mtf_cache.get(symbol)
+    if not cached:
+        return True
+    if cached.get("bar_minute") != bar_minute:
+        return True
+    computed_at = cached.get("computed_at")
+    if not isinstance(computed_at, datetime):
+        return True
+    return (datetime.utcnow() - computed_at).total_seconds() >= MTF_MIN_INTERVAL_SEC
+
+
+def _cache_mtf_signal(symbol: str, bar_minute: datetime, signal: Dict) -> None:
+    _mtf_cache[symbol] = {
+        "bar_minute": bar_minute,
+        "computed_at": datetime.utcnow(),
+        "signal": signal,
+    }
+
+
+def _get_cached_mtf_signal(symbol: str) -> Optional[Dict]:
+    cached = _mtf_cache.get(symbol)
+    if cached:
+        return cached.get("signal")
+    return None
 
 
 # ── Root ──────────────────────────────────────────────────────────────────────
@@ -127,12 +169,14 @@ def system_status() -> Dict:
     """Full status snapshot for dashboard and monitoring."""
     rm = get_risk_manager()
     try:
-        from app.live_data import list_tracked_symbols, get_all_buffer_lengths
+        from app.live_data import list_tracked_symbols, get_all_buffer_lengths, get_ea_config
         tracked = list_tracked_symbols()
         lengths = get_all_buffer_lengths()
+        ea_configs = {s: get_ea_config(s) for s in tracked}
     except Exception:
         tracked = []
         lengths = {}
+        ea_configs = {}
     return {
         "system_mode": get_system_mode(),
         "risk": rm.get_state_dict(),
@@ -144,8 +188,9 @@ def system_status() -> Dict:
             "bad_ticks_total": _metrics["bad_ticks_total"],
         },
         "symbols_tracked": tracked,
-        "buffer_max_m1": 15840,
+        "buffer_max_m1": get_settings().default_buffer_max_m1,
         "live_buffer_lengths": lengths,
+        "ea_configs": ea_configs,
     }
 
 
@@ -283,8 +328,11 @@ def market_data(data: dict, background_tasks: BackgroundTasks) -> Dict:  # noqa:
     timeframe = data.get("timeframe", "M5").upper()
     if timeframe == "TICK":
         timeframe = "M1"
-    is_backfill = data.get("backfill") in (True, "true", 1, "1", "True")
     req_id = str(uuid.uuid4())[:8]
+
+    # Update per-symbol EA config (buffer_max_m1, min_candles_m1, etc.) from every payload
+    from app.live_data import update_ea_config
+    update_ea_config(symbol, data)
 
     # ── Data quality gate ───────────────────────────────────────────────
     bad_reasons = _validate_tick(symbol, data)
@@ -300,21 +348,8 @@ def market_data(data: dict, background_tasks: BackgroundTasks) -> Dict:  # noqa:
         data.get("close"), data.get("bid"), data.get("ask"), data.get("volume"),
     )
 
-    # ── Update live buffer (always, for both live and backfill).
-    # Backfill from EA is the explicit startup seed of recent M1 history.
-    # We want it in the buffer so candles_available and structure see the bars quickly.
-    # The catchup window / stale filter protects *decisions*, not buffer population.
-    # ── Update live buffer ───────────────────────────────────────────────
+    # ── Update live buffer (live stream only — EA config merged in add_market_data) ──
     update_live_bar(symbol, data)
-
-    # ── Historical catch-up guard for decisions (after buffering) ────────
-    if is_backfill:
-        from app.live_data import is_within_catchup_window, to_naive_utc
-        ts_raw = data.get("timestamp")
-        if ts_raw is not None and not is_within_catchup_window(to_naive_utc(ts_raw)):
-            logger.info("[BACKFILL %s] buffered but skipped for decisions (stale) for %s", req_id, symbol)
-            _persist_tick_to_db(symbol, timeframe, data, background_tasks)
-            return {"status": "backfill_buffered_skipped_decisions", "symbol": symbol}
 
     # ── Update equity in RiskManager if EA sends it ─────────────────────
     equity = data.get("equity") or data.get("account_equity")
@@ -339,53 +374,68 @@ def market_data(data: dict, background_tasks: BackgroundTasks) -> Dict:  # noqa:
             base = _flatten_signal_for_ea(base) if mode == "flatten" else base
         return base
 
-    # ── MTF signal (main path) ───────────────────────────────────────────
+    # ── MTF signal (throttled — buffer already updated above) ────────────
     account_equity = float(equity) if equity else None
     spread = float(data.get("spread", 0) or 0)
+    bar_minute = _current_bar_minute(symbol)
+    compute_mtf = _should_compute_mtf(symbol, bar_minute)
 
-    try:
-        signal = get_mtf_structure_signal(
-            symbol=symbol,
-            account_equity=account_equity,
-            spread=spread,
-        )
-    except Exception as exc:
-        logger.error("[SIGNAL %s] MTF error for %s: %s", req_id, symbol, exc, exc_info=True)
-        signal = {"signal": "HOLD", "symbol": symbol, "error": str(exc)}
+    if compute_mtf:
+        try:
+            signal = get_mtf_structure_signal(
+                symbol=symbol,
+                account_equity=account_equity,
+                spread=spread,
+            )
+        except Exception as exc:
+            logger.error("[SIGNAL %s] MTF error for %s: %s", req_id, symbol, exc, exc_info=True)
+            signal = {"signal": "HOLD", "symbol": symbol, "error": str(exc)}
+
+        if signal is None:
+            signal = {"signal": "HOLD", "symbol": symbol, "rationale": "Insufficient live data"}
+
+        _cache_mtf_signal(symbol, bar_minute, signal)
+    else:
+        signal = _get_cached_mtf_signal(symbol) or {
+            "signal": "HOLD",
+            "symbol": symbol,
+            "rationale": "MTF throttled",
+        }
 
     # ── Apply system mode overlays ────────────────────────────────────────
     signal = _apply_system_mode_to_signal(signal)
     _record_signal(str(signal.get("signal", "HOLD")))
 
     # Record for /api/recent-signals (dashboard Structure tab)
-    try:
-        recent_signals_list.append({
-            "ts": datetime.utcnow().isoformat(),
-            "symbol": symbol,
-            "timeframe": "M1",
-            "signal": signal.get("signal"),
-            "score": signal.get("score", 0.0),
-            "confidence": signal.get("confidence", 0.0),
-            "setup": signal.get("setup"),
-            "rationale": signal.get("rationale"),
-            "current_price": signal.get("current_price"),
-        })
-        if len(recent_signals_list) > 200:
-            recent_signals_list.pop(0)
-    except Exception:
-        pass
+    if compute_mtf:
+        try:
+            recent_signals_list.append({
+                "ts": datetime.utcnow().isoformat(),
+                "symbol": symbol,
+                "timeframe": "M1",
+                "signal": signal.get("signal"),
+                "score": signal.get("score", 0.0),
+                "confidence": signal.get("confidence", 0.0),
+                "setup": signal.get("setup"),
+                "rationale": signal.get("rationale"),
+                "current_price": signal.get("current_price"),
+            })
+            if len(recent_signals_list) > 200:
+                recent_signals_list.pop(0)
+        except Exception:
+            pass
 
-    # ── Lifecycle management actions ──────────────────────────────────────
+    # ── Lifecycle management actions (only when MTF runs) ───────────────
     lifecycle_actions = []
-    try:
-        from app.live_data import get_recent_df as _grd
-        m5_df = resample_for_lifecycle(symbol)
-        if m5_df is not None and not m5_df.empty:
-            ms_snap = compute_structure(m5_df, symbol=symbol)
-            actions = _lifecycle_manager.on_bar(m5_df.iloc[-1].to_dict(), ms_snap)
-            lifecycle_actions = [a.to_dict() for a in actions]
-    except Exception as exc:
-        logger.debug("[Lifecycle] on_bar error: %s", exc)
+    if compute_mtf:
+        try:
+            m5_df = resample_for_lifecycle(symbol)
+            if m5_df is not None and not m5_df.empty:
+                ms_snap = compute_structure(m5_df, symbol=symbol)
+                actions = _lifecycle_manager.on_bar(m5_df.iloc[-1].to_dict(), ms_snap)
+                lifecycle_actions = [a.to_dict() for a in actions]
+        except Exception as exc:
+            logger.debug("[Lifecycle] on_bar error: %s", exc)
 
     if lifecycle_actions:
         signal["lifecycle_actions"] = lifecycle_actions
@@ -414,14 +464,18 @@ def _persist_tick_to_db(symbol: str, timeframe: str, data: dict, background_task
 
 
 def _do_persist(symbol: str, timeframe: str, data: dict) -> None:
-    """Actual DB persist — uses pooled cursor, never global conn."""
+    """Actual DB persist — uses pooled cursor, never global conn.
+    Uses bare ON CONFLICT DO NOTHING so it works even if the unique constraint
+    on (symbol, timeframe, timestamp) is not yet present (table may have been
+    created in an older run without the constraint).
+    """
     try:
         with db_cursor() as (conn, cur):
             cur.execute(
                 """
                 INSERT INTO market_data (symbol, timeframe, timestamp, open, high, low, close, tick_volume)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (symbol, timeframe, timestamp) DO NOTHING
+                ON CONFLICT DO NOTHING
                 """,
                 (
                     symbol,
@@ -578,7 +632,8 @@ def _validate_tick(symbol: str, data: dict) -> list:
             from app.live_data import to_naive_utc
             ts_dt = to_naive_utc(ts)
             now = datetime.utcnow()
-            if (ts_dt - now).total_seconds() > 300:
+            # MT5 server time can be hours ahead of UTC; only flag extreme skew.
+            if (ts_dt - now).total_seconds() > 14400:
                 bad.append("future_timestamp")
     except Exception as exc:
         logger.debug("Tick validation error (non-fatal): %s", exc)
