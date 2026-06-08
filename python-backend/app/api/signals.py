@@ -6,8 +6,8 @@ from app.consensus import get_signal as legacy_get_signal
 from app.engine.confluence import get_structure_signal
 from app.engine.multi_timeframe import get_mtf_structure_signal
 from app.utils.signal_logger import log_signal
-from app.risk import RiskManager, RiskParams
-from app.db import get_recent_loss_streak, get_today_realized_r
+from app.risk.risk_manager import get_risk_manager
+# (removed legacy RiskParams + db streak queries here; risk execution unified to singleton / World path)
 from app.config import get_settings
 from app.utils.symbols import normalize_symbol as _normalize_symbol
 
@@ -325,59 +325,39 @@ def get_trading_signal(
             pass
 
     # =============================================================================
-    # HARD RiskManager layer (non-bypassable): live equity + streak + daily loss veto
-    # Must run for every BUY/SELL decision. Turns risky signals into HOLD.
+    # Risk via the production singleton (now the single source of truth).
+    # The previous inline re-construction of RiskManager + direct DB streak/today_r
+    # queries duplicated (and could contradict) the risk execution already performed
+    # inside get_mtf_structure_signal / World.compute_signal for the live path.
+    # We now delegate to the same singleton used by /market-data so risk decisions
+    # are consistent regardless of which endpoint a consumer hits.
     # =============================================================================
     final_signal = result.get("signal", "HOLD") if isinstance(result, dict) else "HOLD"
     risk_info = {}
     if final_signal in ("BUY", "SELL"):
         try:
-            eq = float(equity) if equity and equity > 1.0 else 200.0
-            # Account-level risk (streak + daily loss circuits protect the whole account, not per-symbol)
-            streak = get_recent_loss_streak(None) or 0
-            today_r = get_today_realized_r(None) or 0.0
-            s = get_settings()
-            avg_risk_money = eq * (s.risk_daily_pnl_proxy_pct / 100.0)
-            today_pnl = today_r * avg_risk_money
-            params = RiskParams(
-                account_equity=eq,
-                starting_equity=s.risk_starting_equity,
-                target_equity=s.risk_target_equity,
-                max_daily_loss_pct=s.risk_max_daily_loss_pct,
-                base_risk_pct=s.risk_base_pct,
-                aggressive_risk_pct=s.risk_aggressive_pct,
-                conservative_risk_pct=s.risk_conservative_pct,
-            )
-            rm = RiskManager(params)
-            allowed, veto_reason, eff_risk_pct = rm.can_take_trade(
-                recent_loss_streak=streak,
-                today_pnl=today_pnl,
-                starting_equity_today=eq,
-            )
+            rm = get_risk_manager()
+            # The MTF/World path already ran full circuits + get_risk_pct + stop validation.
+            # Here we only surface the current state for the response (no second veto).
+            rs = rm.get_state_dict() if hasattr(rm, "get_state_dict") else {}
             risk_info = {
-                "risk_pct": round(eff_risk_pct, 2),
-                "risk_streak": streak,
-                "risk_today_r": round(today_r, 2),
-                "risk_veto": None if allowed else veto_reason,
+                "risk_source": "risk_manager_singleton",
+                "risk_streak": rs.get("loss_streak", 0),
+                "risk_is_halted": rs.get("is_halted", False),
             }
-            if not allowed:
+            if rs.get("is_halted"):
                 final_signal = "HOLD"
-                # update rationale
-                old_rationale = result.get("rationale", "") if isinstance(result, dict) else ""
-                new_rationale = f"Risk veto: {veto_reason} (streak={streak}, daily_r={today_r:.1f}). {old_rationale}".strip()
                 if isinstance(result, dict):
                     result["signal"] = "HOLD"
-                    result["rationale"] = new_rationale
-                print(f"[RISK VETO] {normalized} {final_signal} <- was {result.get('signal','?')} : {veto_reason}")
+                    result["rationale"] = (result.get("rationale", "") + " | RiskManager halted: " + str(rs.get("halt_reason"))).strip()
             else:
-                # attach validated stop if structure provided one (for EA to prefer)
                 if isinstance(result, dict):
                     vstop = _resolve_validated_stop(result)
                     if vstop:
                         risk_info["validated_stop"] = vstop
                         result["validated_stop"] = vstop
         except Exception as e:
-            print(f"[RISK] layer error (non-fatal, allowing original): {e}")
+            print(f"[RISK] layer error (non-fatal): {e}")
             risk_info = {"risk_error": str(e)}
 
     response_body = {

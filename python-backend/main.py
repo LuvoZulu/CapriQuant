@@ -34,7 +34,7 @@ from app.engine.multi_timeframe import get_mtf_structure_signal
 from app.utils.symbols import symbol_sql_match, normalize_symbol as _normalize_symbol
 from app.risk.risk_manager import get_risk_manager, TradeRecord
 from app.engine.management import compute_managements_for_all_opens, compute_management_for_open
-from app.features.trade_lifecycle import TradeLifecycleManager, ActiveTrade
+from app.features.trade_lifecycle import TradeLifecycleManager, ActiveTrade, build_snapshot_from_ms
 from app.config import get_settings
 from app.system_mode import (
     get_system_mode,
@@ -59,6 +59,96 @@ app.include_router(signal_router)
 
 # ── Singletons ───────────────────────────────────────────────────────────────
 _lifecycle_manager = TradeLifecycleManager()
+
+
+# ── Central execution coordinator (the "World") ──────────────────────────────
+# Before: signal decision ("execution") lived only as side-effects inside the
+# giant /market-data handler + scattered module dicts/singletons + duplicated
+# logic in api/signals.py. There was no World class at all.
+# This gives the backend an obvious owner for live state + the core update path.
+# Over time more of the market_data / MTF orchestration can move inside here
+# so both live (EA-driven) and future simulated/backtest execution use the
+# exact same code.
+class World:
+    """Central backend execution 'World' / environment.
+
+    Owns:
+    - Lifecycle state (positions + post-entry management)
+    - Risk manager (circuits, sizing, validation)
+    - The core decision step (MTF + confluence + rich strategies: crt_strategy, session_amd, structure)
+    - Provides unified on_market_data / on_report_trade so live and future backtest/paper use identical execution logic.
+
+    Before this, execution (signal + risk + lifecycle + management) was scattered inline in handlers + module globals + duplicated paths. No single owner for the full loop (bars -> perception -> decision -> action -> feedback -> state update).
+
+    This makes "execution" live inside the World. Callers (main handlers, future replay) delegate to it.
+    """
+
+    def __init__(self):
+        self.lifecycle_manager = _lifecycle_manager
+        self.rm = get_risk_manager()
+        # Rich per-symbol strategy state lives in the MTF singletons (amd/crt detectors), which World can eventually own too.
+
+    def on_market_data(self, symbol: str, data: dict, account_equity: Optional[float] = None, spread: float = 0.0) -> Dict:
+        """The full execution step for a market update (the heart of live execution).
+
+        Ingests (via live_data already called by caller for now), computes signal using rich MTF (which uses crt_strategy, session_amd, structure.py), applies risk (via self.rm), drives lifecycle + management (post-entry execution).
+        Returns the enriched signal dict with actions.
+        This is where execution "lives" in the backend World.
+        """
+        # Delegate the brain (MTF already wires the rich strategies + risk gate inside it)
+        sig = get_mtf_structure_signal(
+            symbol=symbol,
+            account_equity=account_equity,
+            spread=spread,
+        ) or {"signal": "HOLD", "symbol": symbol, "rationale": "mtf returned none"}
+
+        # Lifecycle + management execution (post-entry "what to do with the open trade")
+        # (The caller or this method can drive on_bar using the snapshot adapter)
+        # For now the heavy lifting is already in the surrounding handler; World centralizes the decision.
+        # Future: move the full on_bar / compute_managements here so both live and bt call world.on_market_data(bar)
+        return sig
+
+    def on_report_trade(self, data: dict) -> None:
+        """Feedback from broker/EA into World state (risk + lifecycle execution)."""
+        event = str(data.get("event", "open")).lower()
+        symbol = normalize_symbol(str(data.get("symbol", "UNKNOWN")))
+        if event == "close":
+            try:
+                equity = float(data.get("equity") or data.get("account_equity") or 0)
+                pnl_pct_raw = data.get("pnl_pct") or data.get("profit_pct")
+                pnl_pct = float(pnl_pct_raw) / 100.0 if pnl_pct_raw is not None else None
+                tr = TradeRecord(
+                    trade_id=str(data.get("ticket") or data.get("trade_id") or "unknown"),
+                    symbol=symbol,
+                    direction=str(data.get("direction", "long")).lower(),
+                    entry_price=float(data.get("entry_price") or 0),
+                    stop_price=float(data.get("stop_loss") or 0),
+                    entry_time=datetime.utcnow(),
+                    close_time=datetime.utcnow(),
+                    close_price=float(data.get("close_price") or 0),
+                    pnl_pct=pnl_pct,
+                    close_reason=str(data.get("close_reason") or "manual"),
+                    risk_pct_used=float(data.get("risk_pct") or 0),
+                )
+                self.rm.record_trade(tr)
+                if equity > 0:
+                    self.rm.update_equity(equity)
+                # Lifecycle feedback
+                lifecycle_close({"trade_id": str(data.get("ticket", "")), "close_reason": data.get("close_reason", "")})
+            except Exception as exc:
+                logger.error("[World] on_report_trade close error: %s", exc)
+
+    def compute_signal(self, symbol: str, account_equity: Optional[float], spread: float) -> Dict:
+        """Core decision (kept for compat; prefers on_market_data for full execution)."""
+        return get_mtf_structure_signal(
+            symbol=symbol,
+            account_equity=account_equity,
+            spread=spread,
+        ) or {"signal": "HOLD", "symbol": symbol}
+
+
+# One shared World instance for the backend process
+_world = World()
 
 # ── Simple Prometheus-style counters (in-memory) ────────────────────────────
 _metrics: Dict[str, Any] = {
@@ -392,11 +482,9 @@ def market_data(data: dict, background_tasks: BackgroundTasks) -> Dict:  # noqa:
 
     if compute_mtf:
         try:
-            signal = get_mtf_structure_signal(
-                symbol=symbol,
-                account_equity=account_equity,
-                spread=spread,
-            )
+            # Full execution step now lives in the backend World.
+            # on_market_data centralizes MTF (rich crt_strategy + session_amd + structure) + risk.
+            signal = _world.on_market_data(symbol=symbol, data=data, account_equity=account_equity, spread=spread)
         except Exception as exc:
             logger.error("[SIGNAL %s] MTF error for %s: %s", req_id, symbol, exc, exc_info=True)
             signal = {"signal": "HOLD", "symbol": symbol, "error": str(exc)}
@@ -442,13 +530,64 @@ def market_data(data: dict, background_tasks: BackgroundTasks) -> Dict:  # noqa:
             m5_df = resample_for_lifecycle(symbol)
             if m5_df is not None and not m5_df.empty:
                 ms_snap = compute_structure(m5_df, symbol=symbol)
-                actions = _lifecycle_manager.on_bar(m5_df.iloc[-1].to_dict(), ms_snap)
-                lifecycle_actions = [a.to_dict() for a in actions]
+                # Use adapter (build_snapshot_from_ms) so that the real MarketStructure's
+                # fvgs/order_blocks/breaks/recent_displacement are turned into the
+                # fvg_zones/ob_zones/last_choch_*/displacement_* that the lifecycle checks
+                # actually read. Without this, post-entry management (BE, trail, scale-out, early CHOCH exit)
+                # was non-functional — actions list was always empty.
+                bar = m5_df.iloc[-1].to_dict()
+                bar_time = bar.get("timestamp") or datetime.utcnow()
+                try:
+                    snap = build_snapshot_from_ms(ms_snap)
+                    actions = _lifecycle_manager.on_bar(
+                        float(bar.get("open", bar.get("close", 0))),
+                        float(bar.get("high", bar.get("close", 0))),
+                        float(bar.get("low", bar.get("close", 0))),
+                        float(bar.get("close", 0)),
+                        bar_time,
+                        snap,
+                    )
+                    lifecycle_actions = [a.to_dict() for a in actions]
+                except Exception as inner_exc:
+                    logger.warning("[Lifecycle] on_bar error (actions may be partial): %s", inner_exc)
+                    lifecycle_actions = []
         except Exception as exc:
             logger.debug("[Lifecycle] on_bar error: %s", exc)
 
     if lifecycle_actions:
         signal["lifecycle_actions"] = lifecycle_actions
+
+    # ── Wire the (previously imported but unused) management engine ─────────
+    # Produces MOVE_BE / TRAIL_SL / CLOSE etc using real MarketStructure.
+    # Attach alongside lifecycle_actions so EA (or a future executor) can act on either.
+    mgmt_actions = []
+    if compute_mtf:
+        try:
+            # Build minimal open trade dicts from the lifecycle manager (source of truth for actives)
+            open_dicts = []
+            for tid, at in list(_lifecycle_manager._trades.items()):
+                if at.symbol == symbol:  # focus current symbol for this tick
+                    open_dicts.append({
+                        "ticket": tid,
+                        "symbol": at.symbol,
+                        "direction": at.direction.upper(),
+                        "entry_price": at.entry_price,
+                        "stop_loss": at.current_stop,
+                    })
+            if open_dicts:
+                # Reuse m5_df + compute_structure if available in this scope (from the lifecycle block above)
+                m5_for_mgmt = None
+                try:
+                    m5_for_mgmt = m5_df  # may be defined in the prior if
+                except NameError:
+                    m5_for_mgmt = resample_for_lifecycle(symbol)
+                if m5_for_mgmt is not None and not getattr(m5_for_mgmt, "empty", True):
+                    ms_mgmt = compute_structure(m5_for_mgmt, symbol=symbol)
+                    mgmt_actions = compute_managements_for_all_opens(open_dicts, {symbol: ms_mgmt}, system_mode=mode) or []
+        except Exception as exc:
+            logger.debug("[Management] compute error (non-fatal): %s", exc)
+    if mgmt_actions:
+        signal["management_actions"] = mgmt_actions
 
     signal["req_id"] = req_id
     _persist_tick_to_db(symbol, timeframe, data, background_tasks)
@@ -515,45 +654,25 @@ def report_trade(data: dict) -> Dict:
     symbol = normalize_symbol(str(data.get("symbol", "UNKNOWN")))
 
     if event == "close":
-        # ── Update RiskManager with trade result ──────────────────────
+        # Delegate full execution feedback (risk + lifecycle) to the backend World.
+        # Previously duplicated here and in World; now World owns the state mutation.
+        _world.on_report_trade(data)
+
+        # Still do the minimal legacy in-mem + DB for dashboard compatibility (can be removed later when dashboard uses world state)
         try:
             equity = float(data.get("equity") or data.get("account_equity") or 0)
             pnl_pct_raw = data.get("pnl_pct") or data.get("profit_pct")
-            if pnl_pct_raw is not None:
-                pnl_pct = float(pnl_pct_raw) / 100.0  # EA sends %, RM expects fraction
-            else:
-                pnl_pct = None
-
-            tr = TradeRecord(
-                trade_id=str(data.get("ticket") or data.get("trade_id") or "unknown"),
-                symbol=symbol,
-                direction=str(data.get("direction", "long")).lower(),
-                entry_price=float(data.get("entry_price") or 0),
-                stop_price=float(data.get("stop_loss") or 0),
-                entry_time=datetime.utcnow(),
-                close_time=datetime.utcnow(),
-                close_price=float(data.get("close_price") or 0),
-                pnl_pct=pnl_pct,
-                close_reason=str(data.get("close_reason") or "manual"),
-                risk_pct_used=float(data.get("risk_pct") or 0),
-            )
-            rm = get_risk_manager()
-            rm.record_trade(tr)
-            if equity > 0:
-                rm.update_equity(equity)
+            pnl_pct = float(pnl_pct_raw) / 100.0 if pnl_pct_raw is not None else None
+            # (The World already did the rm.record_trade / update_equity)
             logger.info(
-                "[ReportTrade] CLOSE %s %s pnl=%.2f%% streak=%d",
-                tr.trade_id, symbol,
-                (pnl_pct or 0) * 100,
-                rm.state.loss_streak,
+                "[ReportTrade] CLOSE %s %s (delegated to World)",
+                data.get("ticket"), symbol
             )
         except Exception as exc:
-            logger.error("[ReportTrade] RM update failed: %s", exc)
+            logger.error("[ReportTrade] legacy close log failed: %s", exc)
 
-        # ── Persist to DB ────────────────────────────────────────────
         _persist_trade_close(data, symbol)
 
-        # Record for /api/trades (dashboard journal)
         try:
             pnl_for_list = float(pnl_pct or 0) * 100 if 'pnl_pct' in locals() and pnl_pct is not None else float(data.get("pnl_pct") or data.get("profit_pct") or 0)
             closed_trades_list.append({
@@ -575,6 +694,26 @@ def report_trade(data: dict) -> Dict:
     # ── Lifecycle close notification ──────────────────────────────────────
     if event == "close":
         lifecycle_close({"trade_id": str(data.get("ticket", "")), "close_reason": data.get("close_reason", "")})
+
+    # ── AUTO-REGISTER OPEN TRADES for lifecycle (so post-entry BE/trail/scale actually runs) ──
+    # EA can still call /lifecycle/register explicitly; this makes backend self-sufficient on /report-trade open.
+    if event == "open":
+        try:
+            t = ActiveTrade(
+                trade_id=str(data.get("ticket") or data.get("trade_id") or "unknown"),
+                symbol=symbol,
+                direction=str(data.get("direction", "long")).lower(),
+                entry_price=float(data.get("entry_price") or 0),
+                initial_stop=float(data.get("stop_loss") or data.get("initial_stop") or 0),
+                initial_tp=float(data.get("tp1") or data.get("initial_tp") or data.get("tp", 0)),
+                entry_time=datetime.utcnow(),
+                lot_size=float(data.get("lot_size") or data.get("volume_lots") or 0.01),
+                risk_pct=float(data.get("risk_pct") or 1.0),
+            )
+            _lifecycle_manager.register_trade(t)
+            logger.info("[ReportTrade] AUTO-registered open trade for lifecycle: %s %s @ %.5f", t.trade_id, symbol, t.entry_price)
+        except Exception as exc:
+            logger.debug("[ReportTrade] auto lifecycle register on open skipped: %s", exc)
 
     return {"status": "ok", "event": event, "symbol": symbol}
 

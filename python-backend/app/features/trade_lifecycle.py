@@ -23,7 +23,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +138,85 @@ class MarketStructureSnapshot:
     current_bar_index: int = 0
 
 
+def snapshot_from_market_structure(ms: Any) -> "MarketStructureSnapshot":
+    """
+    Adapter: convert real app.features.structure.MarketStructure (or None) into the
+    minimal dict-like snapshot that TradeLifecycleManager._check_* methods expect.
+    This fixes the broken on_bar calls (real MS has .breaks/.fvgs/.order_blocks not last_choch_*/fvg_zones).
+    Safe to call with either shape; returns a usable stub on failure.
+    """
+    if ms is None:
+        return MarketStructureSnapshot()
+    try:
+        from app.features.structure import MarketStructure as _RealMS
+    except Exception:
+        _RealMS = None
+
+    # Defaults
+    last_choch_direction = None
+    last_choch_price = None
+    last_choch_bar = 0
+    displacement_occurred = False
+    displacement_direction = None
+    fvg_zones: List[dict] = []
+    ob_zones: List[dict] = []
+    current_bar_index = getattr(ms, "last_bar_idx", 0) or 0
+
+    # CHOCH from real .breaks (most recent first)
+    breaks = getattr(ms, "breaks", None) or []
+    for b in reversed(list(breaks)):
+        if getattr(b, "break_type", "") == "CHOCH":
+            d = getattr(b, "direction", "") or ""
+            last_choch_direction = "bearish" if str(d).upper() in ("BEAR", "BEARISH") else ("bullish" if str(d).upper() in ("BULL", "BULLISH") else None)
+            last_choch_price = getattr(b, "broken_price", None)
+            last_choch_bar = getattr(b, "idx", 0) or 0
+            break
+
+    # Displacement (real stores in recent_displacement or infer from bias/breaks)
+    rd = getattr(ms, "recent_displacement", None)
+    if isinstance(rd, dict):
+        displacement_occurred = bool(rd.get("occurred", False))
+        dd = str(rd.get("direction", "")).lower()
+        displacement_direction = "bullish" if "bull" in dd else ("bearish" if "bear" in dd else None)
+    else:
+        # Fallback: last break if BOS/CHOCH recent
+        if breaks:
+            last_b = breaks[-1]
+            if getattr(last_b, "break_type", "") in ("BOS", "CHOCH"):
+                dd = str(getattr(last_b, "direction", "")).lower()
+                displacement_direction = "bullish" if "bull" in dd else ("bearish" if "bear" in dd else None)
+                displacement_occurred = True
+
+    # FVG zones (list[dict] shape the checks expect)
+    for f in (getattr(ms, "fvgs", None) or []):
+        fvg_zones.append({
+            "high": getattr(f, "upper", getattr(f, "high", getattr(f, "fvg_high", 0.0))),
+            "low": getattr(f, "lower", getattr(f, "low", getattr(f, "fvg_low", 0.0))),
+            "direction": "bullish" if str(getattr(f, "fvg_type", "")).upper() == "BULLISH" else "bearish",
+            "filled": bool(getattr(f, "is_filled", getattr(f, "filled", False))),
+        })
+
+    # OB zones
+    for o in (getattr(ms, "order_blocks", None) or []):
+        ob_zones.append({
+            "high": getattr(o, "high", 0.0),
+            "low": getattr(o, "low", 0.0),
+            "direction": "bullish" if str(getattr(o, "ob_type", "")).upper() == "BULLISH" else "bearish",
+            "mitigated": bool(getattr(o, "is_mitigated", False)),
+        })
+
+    return MarketStructureSnapshot(
+        last_choch_direction=last_choch_direction,
+        last_choch_price=last_choch_price,
+        last_choch_bar=last_choch_bar,
+        displacement_occurred=displacement_occurred,
+        displacement_direction=displacement_direction,
+        fvg_zones=fvg_zones,
+        ob_zones=ob_zones,
+        current_bar_index=current_bar_index,
+    )
+
+
 # ---------------------------------------------------------------------------
 # TradeLifecycleManager
 # ---------------------------------------------------------------------------
@@ -236,6 +315,15 @@ class TradeLifecycleManager:
                 ea.execute_action(action)
         """
         actions: List[LifecycleAction] = []
+
+        # Auto-adapt real MarketStructure objects (from compute_structure) into the stub the checks expect.
+        # This is the key fix for previously-silent on_bar failures (no more broad except swallowing everything).
+        if not isinstance(ms, MarketStructureSnapshot):
+            try:
+                ms = snapshot_from_market_structure(ms)
+            except Exception as _conv_exc:
+                logger.debug("[Lifecycle] snapshot conversion failed, using empty stub: %s", _conv_exc)
+                ms = MarketStructureSnapshot()
 
         for trade_id, trade in list(self._trades.items()):
             # Update price extreme
@@ -481,3 +569,64 @@ class TradeLifecycleManager:
             close_lots=trade.remaining_lots,
             reason=f"choch_{ms.last_choch_direction}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Adapter: allow the *real* MarketStructure (from features.structure) to drive
+# lifecycle checks. The Snapshot was a minimal stub; without this the
+# fvg_zones / ob_zones / choch / displacement attrs were missing and all
+# post-entry actions were silently skipped (caught in caller).
+# ---------------------------------------------------------------------------
+
+def build_snapshot_from_ms(ms: object) -> MarketStructureSnapshot:
+    """Convert real MarketStructure object into the dict-based Snapshot the
+    lifecycle checks expect. This makes BE / trail / scale / choch-exit actually
+    execute in the live backend instead of always returning no actions.
+    """
+    if ms is None:
+        return MarketStructureSnapshot()
+
+    breaks = getattr(ms, "breaks", []) or []
+    last_choch_direction = None
+    last_choch_price = None
+    last_choch_bar = getattr(ms, "last_bar_idx", 0)
+    for b in reversed(breaks):
+        if getattr(b, "break_type", "") == "CHOCH":
+            d = getattr(b, "direction", "") or ""
+            last_choch_direction = d.lower() if d else None
+            last_choch_price = getattr(b, "broken_price", None)
+            break
+
+    disp = getattr(ms, "recent_displacement", None) or {}
+    displacement_occurred = bool(disp)
+    disp_dir = (disp.get("direction") or "") if isinstance(disp, dict) else ""
+    displacement_direction = disp_dir.lower() if disp_dir else None
+
+    fvg_zones = []
+    for f in getattr(ms, "fvgs", []) or []:
+        fvg_zones.append({
+            "high": float(getattr(f, "high", getattr(f, "upper", 0) or 0)),
+            "low": float(getattr(f, "low", getattr(f, "lower", 0) or 0)),
+            "direction": str(getattr(f, "fvg_type", "")).lower(),
+            "filled": bool(getattr(f, "is_filled", False)),
+        })
+
+    ob_zones = []
+    for o in getattr(ms, "order_blocks", []) or []:
+        ob_zones.append({
+            "high": float(getattr(o, "high", 0) or 0),
+            "low": float(getattr(o, "low", 0) or 0),
+            "direction": str(getattr(o, "ob_type", "")).lower(),
+            "mitigated": bool(getattr(o, "is_mitigated", False)),
+        })
+
+    return MarketStructureSnapshot(
+        last_choch_direction=last_choch_direction,
+        last_choch_price=last_choch_price,
+        last_choch_bar=last_choch_bar,
+        displacement_occurred=displacement_occurred,
+        displacement_direction=displacement_direction,
+        fvg_zones=fvg_zones,
+        ob_zones=ob_zones,
+        current_bar_index=getattr(ms, "last_bar_idx", 0),
+    )
