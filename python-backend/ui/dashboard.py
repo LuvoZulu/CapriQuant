@@ -447,6 +447,86 @@ hr { border-color: var(--border-dim) !important; }
     gap: 10px;
 }
 .lc-meta { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-mid); }
+
+/* ── Horizontal scrollable structure cards ── */
+.structure-scroll-container {
+    display: flex;
+    overflow-x: auto;
+    gap: 12px;
+    padding: 2px 4px 14px 2px;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+    scroll-behavior: smooth;
+}
+.structure-scroll-container::-webkit-scrollbar {
+    height: 6px;
+}
+.structure-scroll-container::-webkit-scrollbar-thumb {
+    background: var(--border-mid);
+    border-radius: 3px;
+}
+.sym-card-full {
+    min-width: 262px;
+    max-width: 262px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border-dim);
+    border-radius: 12px;
+    padding: 11px 12px;
+    flex-shrink: 0;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+}
+.sym-metrics {
+    display: flex;
+    gap: 6px;
+    margin: 7px 0 5px;
+}
+.sym-metric {
+    flex: 1;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-dim);
+    border-radius: 7px;
+    padding: 5px 6px;
+    text-align: center;
+}
+.sym-metric .label {
+    font-size: 0.55rem;
+    color: var(--text-lo);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.sym-metric .value {
+    font-family: var(--font-mono);
+    font-size: 1.05rem;
+    font-weight: 700;
+    line-height: 1.05;
+    color: var(--text-hi);
+}
+.sym-progress {
+    margin: 3px 0 2px;
+}
+.sym-progress-label {
+    font-size: 0.55rem;
+    color: var(--text-mid);
+    margin-bottom: 2px;
+}
+.sym-progress-track {
+    background: var(--border-dim);
+    height: 5px;
+    border-radius: 3px;
+    overflow: hidden;
+}
+.sym-progress-fill {
+    height: 100%;
+    transition: width 0.2s;
+}
+.sym-card-caption {
+    font-size: 0.54rem;
+    color: var(--text-lo);
+    line-height: 1.25;
+    margin-top: 3px;
+}
 .lc-id   { font-family: var(--font-mono); font-size: 0.88rem; font-weight: 600; color: var(--text-hi); }
 .lc-rr   { font-family: var(--font-mono); font-size: 1.15rem; font-weight: 700; }
 .lc-tiny { font-family: var(--font-ui); font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-lo); }
@@ -885,66 +965,111 @@ with tab_overview:
         f"Readiness based on M1 count (37 M1 = strong) &nbsp;·&nbsp; M5 derived for MTF"
     )
 
-    # ── Symbol Cards ─────────────────────────────────────────────────────────
+    # ── Symbol Cards (horizontal scrollable — all pairs visible by scrolling) ──
     st.markdown('<div class="cq-section">Live Market Structure — Readiness per Symbol</div>', unsafe_allow_html=True)
 
-    card_cols = st.columns(len(SYMBOLS))
-    for i, sym in enumerate(SYMBOLS):
+    # IMPORTANT: We build ONE single st.html() call containing the flex container + ALL cards.
+    # Multiple st.html() calls in a loop get wrapped by Streamlit in separate DOM containers,
+    # which breaks the CSS flex + horizontal scroll. One blob keeps the .structure-scroll-container
+    # as the direct parent of the .sym-card-full children.
+
+    cards_html = []
+    for sym in SYMBOLS:
         snap = fetch_current(sym)
-        with card_cols[i]:
-            buf  = snap.get("buffer", {}) if isinstance(snap, dict) else {}
-            m1c   = buf.get("bars_in_buffer", 0) or buf.get("effective_bars", 0)
-            m5c   = buf.get("m5_bars_in_buffer", 0)
-            m5mx  = buf.get("max_m5_bars", 3168)
-            m5p   = buf.get("m5_pct_full", 0)
-            ticks = buf.get("ticks_received", 0)
+        buf  = snap.get("buffer", {}) if isinstance(snap, dict) else {}
+        m1c   = buf.get("bars_in_buffer", 0) or buf.get("effective_bars", 0)
+        m5c   = buf.get("m5_bars_in_buffer", 0)
+        m5mx  = buf.get("max_m5_bars", 3168)
+        m5p   = buf.get("m5_pct_full", 0)
+        ticks = buf.get("ticks_received", 0)
 
-            # Readiness now primarily based on M1 live accumulation (new live_data design).
-            # With 37 M1 we should no longer be "insufficient". M5 is derived/secondary for MTF.
-            if m1c < 5:
-                readiness, r_icon, r_color = "INSUFFICIENT", "🔴", "var(--red)"
-            elif m1c < 15:
-                readiness, r_icon, r_color = "BASIC",        "🟡", "var(--yellow)"
-            elif m1c < 30:
-                readiness, r_icon, r_color = "GOOD",         "🟢", "var(--accent)"
-            else:
-                readiness, r_icon, r_color = "STRONG",       "✅", "var(--green)"
+        # Readiness logic (M1-focused live accumulation)
+        if m1c < 5:
+            readiness, r_icon, r_color = "INSUFFICIENT", "🔴", "var(--red)"
+        elif m1c < 15:
+            readiness, r_icon, r_color = "BASIC",        "🟡", "var(--yellow)"
+        elif m1c < 30:
+            readiness, r_icon, r_color = "GOOD",         "🟢", "var(--accent)"
+        else:
+            readiness, r_icon, r_color = "STRONG",       "✅", "var(--green)"
 
-            insufficient = "error" in snap or snap.get("status") == "insufficient_live_data" or m1c < 5
-            bias  = "N/A" if insufficient else snap.get("bias", "?")
-            price = snap.get("current_price")
+        insufficient = "error" in snap or snap.get("status") == "insufficient_live_data" or m1c < 5
+        bias  = "N/A" if insufficient else snap.get("bias", "?")
+        price = snap.get("current_price")
+        price_str = f"{price:.2f}" if price else "— —"
 
-            if "BULL" in bias:
-                b_color = "var(--green)"
-            elif "BEAR" in bias:
-                b_color = "var(--red)"
-            else:
-                b_color = "var(--yellow)"
+        if "BULL" in bias:
+            b_color = "var(--green)"
+        elif "BEAR" in bias:
+            b_color = "var(--red)"
+        else:
+            b_color = "var(--yellow)"
 
-            st.html(f"""
-            <div class="sym-card">
-              <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                <span class="sym-label">{sym}</span>
-                <span style="font-family:var(--font-mono); font-size:0.62rem; color:{r_color};">{r_icon} {readiness}</span>
-              </div>
-              <div class="sym-bias" style="color:{b_color};">{bias}</div>
-              <div class="sym-price">{f'{price:.2f}' if price else '— —'}</div>
-              <div class="sym-summary">{snap.get('structure_summary', 'Awaiting data...') if not insufficient else 'Insufficient live data'}</div>
+        # Pull full structure data (supports both old keys and the richer structure_richness)
+        rich = snap.get("structure_richness", {}) if isinstance(snap, dict) else {}
+        bull_obs = snap.get("active_bullish_obs") or rich.get("active_bull_obs", 0) or 0
+        bear_obs = snap.get("active_bearish_obs") or rich.get("active_bear_obs", 0) or 0
+        swings   = snap.get("swing_count") or rich.get("swing_count", 0) or 0
+        unfilled_fvgs = rich.get("unfilled_bull_fvgs", 0) + rich.get("unfilled_bear_fvgs", 0)
+        manip = "yes" if rich.get("manipulation_detected") else "no"
+        recent_breaks = rich.get("recent_bos_choch", 0)
+
+        summary = snap.get("structure_summary", "Awaiting live bars...") if not insufficient else "Insufficient live data"
+
+        bcount  = buf.get("effective_bars", buf.get("bars_in_buffer", 0))
+        pct_m1  = min(buf.get("pct_full", 0) / 100.0, 1.0)
+        pct_m5  = min(m5p / 100.0, 1.0)
+
+        caption = f"M1 live accumulation (ticks={ticks}). M1 ≥15 for basic structure; M5 for MTF confirmation. With 37 M1 the card now shows strong readiness (M5 ~{m5c})."
+
+        # Full self-contained card
+        card = f"""
+        <div class="sym-card-full">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+            <span class="sym-label">{sym}</span>
+            <span style="font-family:var(--font-mono); font-size:0.58rem; color:{r_color};">{r_icon} {readiness}</span>
+          </div>
+          <div class="sym-bias" style="color:{b_color}; font-size:1.65rem;">{bias}</div>
+          <div class="sym-price">{price_str}</div>
+          <div class="sym-summary">{summary}</div>
+
+          <div class="sym-metrics">
+            <div class="sym-metric">
+              <div class="label">Bull OBs</div>
+              <div class="value" style="color:var(--green);">{bull_obs}</div>
             </div>
-            """)
+            <div class="sym-metric">
+              <div class="label">Bear OBs</div>
+              <div class="value" style="color:var(--red);">{bear_obs}</div>
+            </div>
+            <div class="sym-metric">
+              <div class="label">Swings</div>
+              <div class="value">{swings}</div>
+            </div>
+          </div>
 
-            if not insufficient:
-                ob1, ob2, ob3 = st.columns(3)
-                ob1.metric("Bull OBs", snap.get("active_bullish_obs", 0))
-                ob2.metric("Bear OBs", snap.get("active_bearish_obs", 0))
-                ob3.metric("Swings",   snap.get("swing_count", 0))
+          {"<div style='font-size:0.55rem;color:var(--text-lo);margin-bottom:4px;'>Unfilled FVGs: " + str(unfilled_fvgs) + " • Breaks: " + str(recent_breaks) + " • Manip: " + manip + "</div>" if not insufficient else ""}
 
-            bcount  = buf.get("effective_bars", buf.get("bars_in_buffer", 0))
-            pct_m1  = min(buf.get("pct_full", 0) / 100, 1.0)
-            pct_m5  = min(m5p / 100, 1.0)
-            st.progress(pct_m1, text=f"M1: {bcount} bars ({buf.get('pct_full',0):.0f}%)")
-            st.progress(pct_m5, text=f"M5: {m5c}/{m5mx} ({m5p:.0f}%)")
-            st.caption(f"M1 live accumulation (ticks={ticks}). M1 ≥15 for basic structure; M5 for MTF confirmation. With 37 M1 the card now shows strong readiness (M5 ~{m5c}).")
+          <div class="sym-progress">
+            <div class="sym-progress-label">M1: {bcount} bars ({buf.get('pct_full',0):.0f}%)</div>
+            <div class="sym-progress-track">
+              <div class="sym-progress-fill" style="width:{pct_m1*100:.0f}%; background:var(--accent);"></div>
+            </div>
+          </div>
+          <div class="sym-progress">
+            <div class="sym-progress-label">M5: {m5c}/{m5mx} ({m5p:.0f}%)</div>
+            <div class="sym-progress-track">
+              <div class="sym-progress-fill" style="width:{pct_m5*100:.0f}%; background:var(--purple);"></div>
+            </div>
+          </div>
+
+          <div class="sym-card-caption">{caption}</div>
+        </div>
+        """
+        cards_html.append(card)
+
+    full_html = '<div class="structure-scroll-container">' + ''.join(cards_html) + '</div>'
+    st.html(full_html)
 
     # ── Signal Engine Summary ─────────────────────────────────────────────────
     st.markdown('<div class="cq-section" style="margin-top:20px;">Signal Engine Activity (cumulative since restart)</div>', unsafe_allow_html=True)

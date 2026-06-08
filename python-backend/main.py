@@ -27,7 +27,7 @@ from fastapi.responses import PlainTextResponse
 
 from app.db import db_cursor
 from app.api.signals import router as signal_router
-from app.live_data import get_recent_df, live_buffer, add_market_data as update_live_bar
+from app.live_data import get_recent_df, live_buffer, add_market_data as update_live_bar, to_naive_utc, is_within_catchup_window
 from app.features.builder import compute_structure
 from app.engine.confluence import get_structure_signal, evaluate_setups
 from app.engine.multi_timeframe import get_mtf_structure_signal
@@ -452,14 +452,23 @@ def market_data(data: dict, background_tasks: BackgroundTasks) -> Dict:  # noqa:
 
     _persist_tick_to_db(symbol, timeframe, data, background_tasks)
 
+    # ── Determine backfill vs live for the skip decision (prevents NameError + enables logic)
+    # We always apply buffer/equity/persist above. Only skip heavy signal compute for *stale* historical.
+    is_backfill = False
+    ts_raw = data.get("timestamp")
+    try:
+        if ts_raw is not None:
+            ts_dt = to_naive_utc(ts_raw)
+            if not is_within_catchup_window(ts_dt):
+                is_backfill = True
+    except Exception:
+        pass
+
     # ── Only for clearly stale backfill do we skip the M1 signal path.
     # Recent backfill data has already driven the buffer + equity + persist above.
     if is_backfill:
-        from app.live_data import is_within_catchup_window, to_naive_utc
-        ts_raw = data.get("timestamp")
-        if ts_raw is not None and not is_within_catchup_window(to_naive_utc(ts_raw)):
-            logger.info("[BACKFILL %s] buffer+side-effects done, skipping heavy M1 signal (stale) for %s", req_id, symbol)
-            return {"status": "backfill_buffered_skipped_decisions", "symbol": symbol}
+        logger.info("[BACKFILL %s] buffer+side-effects done, skipping heavy M1 signal (stale) for %s", req_id, symbol)
+        return {"status": "backfill_buffered_skipped_decisions", "symbol": symbol}
 
     # ── Only compute signal on M1 (main tick timeframe) ──────────────────
     if timeframe != "M1" or bad_reasons:

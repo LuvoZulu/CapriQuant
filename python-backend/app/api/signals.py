@@ -1,7 +1,9 @@
 import pandas as pd
 import json
 from fastapi import APIRouter, HTTPException, Query
-from app.features.builder import compute_features, compute_structure, get_enriched_features
+from app.features.builder import compute_structure, get_enriched_features
+# compute_features (with MACD/RSI/EMA etc.) is deliberately NOT imported/used for any structure/crt/session_amd/risk paths.
+# It remains only for legacy backtest experiments if explicitly opted into elsewhere.
 from app.consensus import get_signal as legacy_get_signal
 from app.engine.confluence import get_structure_signal
 from app.engine.multi_timeframe import get_mtf_structure_signal
@@ -139,12 +141,13 @@ def get_current_structure(symbol: str):
         buf = {"bars_in_buffer": 0, "m5_bars_in_buffer": 0, "pct_full": 0, "m5_pct_full": 0}
         current_price = None
 
-    # Attempt a lightweight MTF snapshot for bias/summary/obs counts (non-fatal)
+    # Attempt a lightweight MTF snapshot for bias/summary/obs counts + full richness (non-fatal)
     bias = "NEUTRAL"
     summary = "Awaiting live bars..."
     bull_obs = 0
     bear_obs = 0
     swings = 0
+    structure_richness = None
     try:
         from app.engine.multi_timeframe import get_mtf_structure_signal
         res = get_mtf_structure_signal(
@@ -159,6 +162,8 @@ def get_current_structure(symbol: str):
             swings = ms.get("swing_count", res.get("swing_count", 0)) or 0
             if current_price is None:
                 current_price = res.get("current_price")
+            # Pass the rich structure details we now stamp (unfilled FVGs, obs counts, manipulation, breaks, etc.)
+            structure_richness = res.get("structure_richness")
     except Exception:
         # Fall back to buffer-driven status only; UI will still show correct M1/M5 counts
         if buf.get("m5_bars_in_buffer", 0) >= 8:
@@ -170,7 +175,7 @@ def get_current_structure(symbol: str):
     if buf.get("bars_in_buffer", 0) < 5:
         status = "insufficient_live_data"
 
-    return {
+    payload = {
         "symbol": normalized,
         "buffer": buf,
         "current_price": current_price,
@@ -181,6 +186,9 @@ def get_current_structure(symbol: str):
         "swing_count": swings,
         "status": status,
     }
+    if structure_richness:
+        payload["structure_richness"] = structure_richness
+    return payload
 
 
 @router.get("/debug/live-buffer")
@@ -315,8 +323,13 @@ def get_trading_signal(
             ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 10)
             result = get_structure_signal(ms, spread)
     else:
-        features = compute_features(df)
-        result = legacy_get_signal(features, spread)
+        # Strictly avoid MACD/RSI/EMA/legacy indicator soup for core evaluation.
+        # Force structure path (compute_structure + get_structure_signal) even for other engines.
+        # This ensures we only use structure.py (full), crt_strategy (via MTF), session_amd (via MTF),
+        # and risk_manager.py. No crt.py, amd.py, risk.py, and no oscillator features for decisions.
+        ms = compute_structure(df, symbol=normalized, timeframe=timeframe, min_candles=min_candles or 10)
+        result = get_structure_signal(ms, spread)
+        result["engine"] = (engine or "structure") + "_forced_structure"
 
     if engine in ("structure", "mtf", "structure_mtf"):
         try:

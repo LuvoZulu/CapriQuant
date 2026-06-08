@@ -444,11 +444,23 @@ def filter_df_to_catchup_window(df: Optional[pd.DataFrame], hours: Optional[floa
 
 
 def is_within_catchup_window(ts, hours: Optional[float] = None) -> bool:
-    return True
+    """True if the bar timestamp is recent enough to drive live trading decisions.
+    Older data is still accepted for buffer seeding / DB but we skip heavy signal path.
+    """
+    if ts is None:
+        return True
+    try:
+        ts = to_naive_utc(ts)
+        cutoff = catchup_cutoff(hours)
+        return ts >= cutoff
+    except Exception:
+        return True
 
 
 def catchup_cutoff(hours: Optional[float] = None) -> datetime:
-    return datetime.utcnow() - timedelta(hours=26)
+    """Cutoff for 'live' vs historical backfill. Default 8h; older posts are treated as backfill seed only."""
+    hours = hours if hours is not None else 8.0
+    return datetime.utcnow() - timedelta(hours=hours)
 
 
 # Back-compat for any direct imports of these

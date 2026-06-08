@@ -133,26 +133,8 @@ def get_mtf_structure_signal(
     else:
         m15_bias = "NEUTRAL"
 
-    # ── 5. M5 setup evaluation ───────────────────────────────────────────
-    m5_signal = get_structure_signal(ms_m5, spread=spread)
-    direction = m5_signal.get("signal", "HOLD")
-
-    if direction not in ("BUY", "SELL"):
-        return _hold(symbol, "m5_no_setup")
-
-    # M5 confluence gate
-    m5_conf = float(m5_signal.get("confluence", 0))
-    if m5_conf < MIN_M5_CONFLUENCE:
-        return _hold(symbol, f"m5_confluence_too_low:{m5_conf:.3f}")
-
-    # M15 opposing bias veto
-    if ms_m15 is not None:
-        if direction == "BUY" and m15_bias == "BEARISH":
-            return _hold(symbol, "m15_opposing_bias_bearish")
-        if direction == "SELL" and m15_bias == "BULLISH":
-            return _hold(symbol, "m15_opposing_bias_bullish")
-
-    # ── 6. CRT confluence injection ──────────────────────────────────────
+    # ── 5. M5 setup evaluation + early CRT (so CRT is used in direction + gates) ──
+    # Compute rich CRT first (raids, EQ, expansions) — one of the core components.
     crt = _get_crt(symbol)
     crt_setups = []
     crt_levels: Dict = {}
@@ -168,40 +150,89 @@ def get_mtf_structure_signal(
             )
         if ms_m5 is not None:
             crt.update_price(float(ms_m5.current_price))
+            # Start neutral so we can discover CRT setups in either direction
             crt_setups = crt.evaluate_crt_setups(
                 ms_m5.current_price,
-                htf_direction=direction,
+                htf_direction="NEUTRAL",
             )
             crt_levels = crt.get_active_levels()
     except Exception as exc:
         logger.debug("[CRT] scoring skipped: %s", exc)
 
-    # Add CRT confidence boost to m5_signal
-    crt_boost = sum(s.confidence for s in crt_setups if s.direction == direction) * 0.25
-    adjusted_confidence = min(100.0, float(m5_signal.get("confidence", 60)) + crt_boost * 10)
+    # Primary direction from structure engine (OB / liquidity / fib / structure setups)
+    m5_signal = get_structure_signal(ms_m5, spread=spread)
+    direction = m5_signal.get("signal", "HOLD")
+
+    # If structure engine found no setup, let strong CRT component propose direction (uses every core).
+    if direction not in ("BUY", "SELL") and crt_setups:
+        buys = [s for s in crt_setups if getattr(s, "direction", None) == "BUY"]
+        sells = [s for s in crt_setups if getattr(s, "direction", None) == "SELL"]
+        if buys or sells:
+            best_buy_conf = max((s.confidence for s in buys), default=0.0)
+            best_sell_conf = max((s.confidence for s in sells), default=0.0)
+            if best_buy_conf >= best_sell_conf and best_buy_conf > 0.55:
+                direction = "BUY"
+                m5_signal = {
+                    "signal": "BUY",
+                    "confluence": 0.58,
+                    "confidence": 58.0,
+                    "setup": "CRT_RANGE",
+                    "rationale": "Primary from CRT (no base structure OB/liquidity setup)",
+                    "price": ms_m5.current_price,
+                }
+            elif best_sell_conf > 0.55:
+                direction = "SELL"
+                m5_signal = {
+                    "signal": "SELL",
+                    "confluence": 0.58,
+                    "confidence": 58.0,
+                    "setup": "CRT_RANGE",
+                    "rationale": "Primary from CRT (no base structure OB/liquidity setup)",
+                    "price": ms_m5.current_price,
+                }
+
+    if direction not in ("BUY", "SELL"):
+        return _hold(symbol, "m5_no_setup")
+
+    # Now apply CRT boost to BOTH confidence and confluence *before* gates
+    # (ensures CRT contributes to the MIN_M5_CONFLUENCE gate and final decisions)
+    rich_crt_score = 0.0
+    if crt_setups:
+        matching = [s for s in crt_setups if getattr(s, "direction", None) == direction]
+        if matching:
+            rich_crt_score = max(s.confidence for s in matching)
+
+    # Confidence boost (CRT)
+    crt_boost = sum(getattr(s, "confidence", 0.0) for s in crt_setups if getattr(s, "direction", None) == direction) * 0.25
+    base_conf = float(m5_signal.get("confidence", 60) or 60)
+    adjusted_confidence = min(100.0, base_conf + crt_boost * 10)
     m5_signal["confidence"] = round(adjusted_confidence, 1)
+
+    # Confluence boost (CRT) — base from structure engine has crt=0 inside evaluate
+    base_confluence = float(m5_signal.get("confluence", 0) or 0)
+    enhanced_confluence = min(1.0, base_confluence + rich_crt_score * 0.35)
+    m5_signal["confluence"] = round(enhanced_confluence, 3)
+
     if crt_setups:
         m5_signal["crt_setups"] = [s.to_dict() for s in crt_setups]
     if crt_levels:
         m5_signal["crt_levels"] = crt_levels
-
-    # ── Rich CRT from crt_strategy.py now contributes directly to confluence score ──
-    # This ensures the full CRTStrategy (raids, EQ bounces, expansions, HTF bias)
-    # affects the confluence number used for risk sizing and reporting.
-    # (The core get_structure_signal no longer uses the deprecated crt.py)
-    rich_crt_score = 0.0
-    if crt_setups:
-        matching = [s for s in crt_setups if s.direction == direction]
-        if matching:
-            rich_crt_score = max(s.confidence for s in matching)
-    # Blend rich CRT into the confluence that came from base (which now has crt=0)
-    base_confluence = float(m5_signal.get("confluence", 0) or 0)
-    enhanced_confluence = min(1.0, base_confluence + rich_crt_score * 0.35)
-    m5_signal["confluence"] = round(enhanced_confluence, 3)
     if "contextual_scores" not in m5_signal:
         m5_signal["contextual_scores"] = {}
     m5_signal["contextual_scores"]["crt"] = round(rich_crt_score, 3)
-    m5_signal["contextual_scores"]["crt_strategy"] = True  # marker that rich crt_strategy was used
+    m5_signal["contextual_scores"]["crt_strategy"] = True
+
+    # M5 confluence gate — NOW uses the enhanced value that includes CRT component
+    m5_conf = float(m5_signal.get("confluence", 0))
+    if m5_conf < MIN_M5_CONFLUENCE:
+        return _hold(symbol, f"m5_confluence_too_low:{m5_conf:.3f}")
+
+    # M15 opposing bias veto (after direction is final, which may have come from CRT)
+    if ms_m15 is not None:
+        if direction == "BUY" and m15_bias == "BEARISH":
+            return _hold(symbol, "m15_opposing_bias_bearish")
+        if direction == "SELL" and m15_bias == "BULLISH":
+            return _hold(symbol, "m15_opposing_bias_bullish")
 
     # ── 7. M1 entry confirmation ─────────────────────────────────────────
     ms_m1 = compute_structure(completed_m1.tail(60), symbol=symbol) if len(completed_m1) >= 15 else None
@@ -232,11 +263,23 @@ def get_mtf_structure_signal(
         rm.update_equity(account_equity)
 
     confluence_score = float(m5_signal.get("confluence", 0))
-    # Modulate with rich AMD conviction (session_amd.py) — if we reached here the phase was tradeable,
-    # but lower conviction still de-risks via quality input to RiskManager.
+    # AMD conviction from session_amd.py — now AMPLIFIES good setups when phase/conviction aligns
+    # (in addition to gating earlier). High conviction on a strong confluence setup increases
+    # quality passed to RiskManager (larger risk_pct when everything aligns autonomously).
     if amd_result is not None:
-        amd_conv = max(0.6, getattr(amd_result, 'conviction', 1.0))
-        confluence_score = min(1.0, confluence_score * amd_conv)
+        amd_conv = getattr(amd_result, 'conviction', 0.85)
+        phase = getattr(amd_result, 'phase', None)
+        # Allow amplification > base when conviction high and direction makes sense for the phase
+        amp = 1.0
+        if amd_conv > 0.65:
+            amp = 0.95 + (amd_conv - 0.5) * 0.7   # can go above 1.0 e.g. 1.25 at high conv
+            # Extra if phase matches expansion/bias
+            if phase and "NY" in str(phase).upper() or "EXPAND" in str(phase).upper():
+                amp = min(1.35, amp * 1.08)
+        confluence_score = min(1.0, confluence_score * amp)
+        # Still respect a floor for very low conviction
+        if amd_conv < 0.55:
+            confluence_score = min(confluence_score, 0.82)
     risk_pct = rm.get_risk_pct(setup_quality=min(1.0, confluence_score))
     if risk_pct is None:
         return _hold(symbol, f"risk_manager_halt:{rm.state.halt_reason}")

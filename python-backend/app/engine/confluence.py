@@ -19,9 +19,63 @@ from dataclasses import dataclass
 from app.features.structure import MarketStructure, OrderBlock
 
 # Import the fully rewritten contextual analyzers
-from app.strategies import amd, fibonacci, price_action, liquidity, structure as struc_mod
+# IMPORTANT: We ONLY use:
+# - structure from strategies/structure.py (full potential)
+# - fibonacci, price_action, liquidity (contextual at structure)
+# - AMD context derived from MarketStructure.session (populated by structure engine) + session_amd detector (in MTF layer)
+# DO NOT import or use: amd.py, crt.py, or any legacy indicator-based (MACD/RSI/EMA etc.)
+from app.strategies import fibonacci, price_action, liquidity, structure as struc_mod
 # Note: old crt.py is deliberately not used. Rich CRT comes from crt_strategy.py via MTF pipeline.
 from app.config import get_settings
+
+
+def _derive_amd_context_from_structure(ms: MarketStructure, direction: str) -> float:
+    """
+    Derive AMD/session timing score purely from MarketStructure.session richness
+    (no amd.py allowed). This uses the session fields populated during
+    compute_market_structure (Asian range, manipulation, expansion, phase).
+    Used for autonomous scoring in evaluate_setups (base path) and MTF.
+    Higher when phase + manipulation/expansion align with direction.
+    """
+    if not ms or not hasattr(ms, 'session'):
+        return 0.0
+    sess = ms.session
+    score = 0.0
+    d = direction.upper()
+
+    # Manipulation (London sweep of Asian) is high-value for reversal/liquidity setups
+    if getattr(sess, 'manipulation_detected', False):
+        if d == "BUY" and getattr(sess, 'phase', '') in ("LONDON_OPEN", "NY_OPEN"):
+            score += 0.65
+        elif d == "SELL" and getattr(sess, 'phase', '') in ("LONDON_OPEN", "NY_OPEN"):
+            score -= 0.65
+
+    # Expansion / Distribution phase (NY) — trend participation
+    if getattr(sess, 'phase', '') in ("NY_OPEN", "NY_PM"):
+        exp_dir = getattr(sess, 'expansion_direction', None)
+        is_exp = getattr(sess, 'is_expanded', False)
+        if is_exp and exp_dir:
+            if d == "BUY" and exp_dir == "UP":
+                score += 0.75
+            elif d == "SELL" and exp_dir == "DOWN":
+                score -= 0.75
+        else:
+            # Still give some credit for phase bias match even without perfect expansion flag
+            if d == "BUY":
+                score += 0.35
+            elif d == "SELL":
+                score -= 0.35
+
+    # Accumulation / Asian — mostly wait or low conviction (prepare)
+    if getattr(sess, 'phase', '') in ("ASIAN", "OFF_SESSION"):
+        # Small bias toward eventual expansion direction, but low
+        if d == "BUY":
+            score += 0.15
+        elif d == "SELL":
+            score -= 0.15
+        score = max(score, -0.25) if d == "SELL" else min(score, 0.25)
+
+    return max(-1.0, min(1.0, score))
 
 
 def generate_structure_summary(ms: MarketStructure) -> str:
@@ -226,15 +280,17 @@ def evaluate_setups(ms: MarketStructure, spread: float = 0.0) -> List[Setup]:
     atr = ms.atr if ms.atr > 0 else max(0.0001, price * 0.0008)
 
     # ------------------------------------------------------------------
-    # CONTEXTUAL ANALYZERS
+    # CONTEXTUAL ANALYZERS (derived from allowed sources only)
     # ------------------------------------------------------------------
-    amd_score = amd.analyze_amd_structure(ms)
+    # AMD: derived from MarketStructure.session (rich session/AMD fields) — no amd.py
+    amd_score = _derive_amd_context_from_structure(ms, "BUY")  # will be signed later per direction
     fib_score = fibonacci.analyze_fib_confluence(ms)
     pa_score = price_action.analyze_price_action_contextual(ms)
     liq_score = liquidity.analyze_liquidity_sweeps(ms)
-    # CRT from old crt.py removed per requirement. Rich CRT logic from crt_strategy.py
-    # is injected in the MTF path (multi_timeframe.py) and contributes to final confluence.
+    # CRT: 0 here (base path). Rich version from crt_strategy.py is injected early
+    # in MTF (multi_timeframe.py) so it affects gates and can originate direction.
     crt_score = 0.0
+    # Structure: use to fullest potential (we also enhance analyze_structure below)
     struc_score = struc_mod.analyze_structure(ms) if hasattr(struc_mod, 'analyze_structure') else 0.0
 
     s = get_settings()
@@ -520,13 +576,14 @@ def get_structure_signal(ms: MarketStructure, spread: float = 0.0) -> Dict:
     mapped_score = best.score * (1.0 if best.direction == "BUY" else -1.0)
 
     # Recompute the contextual scores here (they live only inside evaluate_setups).
-    # This prevents the NameError on amd_score / fib_score / pa_score / liq_score.
-    amd_score = amd.analyze_amd_structure(ms)
+    # This prevents the NameError... Now uses derive for AMD (no amd.py) + full structure.py.
+    amd_score = _derive_amd_context_from_structure(ms, best.direction)
     fib_score = fibonacci.analyze_fib_confluence(ms)
     pa_score = price_action.analyze_price_action_contextual(ms)
     liq_score = liquidity.analyze_liquidity_sweeps(ms)
-    # CRT from old crt.py removed per requirement. Rich CRT logic from crt_strategy.py
-    # is injected in the MTF path (multi_timeframe.py) and contributes to final confluence.
+    # CRT from old crt.py removed. Rich CRT (raids/EQ/expansions from crt_strategy.py)
+    # is evaluated early in the MTF path (multi_timeframe.py) and injected into
+    # confluence/confidence *before* gates so it participates in BUY/SELL decisions.
     crt_score = 0.0
     struc_score = struc_mod.analyze_structure(ms) if hasattr(struc_mod, 'analyze_structure') else 0.0
     total_confluence = _directional_confluence(
