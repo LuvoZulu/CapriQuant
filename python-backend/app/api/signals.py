@@ -227,10 +227,14 @@ def get_trading_signal(
 
     # Live buffer only — no DB / historical fallback
     candles_available = 0
+    effective_closed_m1 = 0
     try:
         buf_status = get_buffer_status(normalized)
-        # Report M1 count from live market (buffer is always M1 from ticks/market)
-        candles_available = buf_status.get("bars_in_buffer", 0)
+        raw = buf_status.get("bars_in_buffer", 0)
+        # Effective for decisions: exclude the current forming bar (last one is usually still updating)
+        effective_closed_m1 = max(0, raw - 1)
+        # But for brand new / backfill-heavy buffers, if we have many we can be more generous
+        candles_available = raw if raw >= 8 else effective_closed_m1
     except Exception as e:
         print(f"[SIGNALS] live buffer count failed for {normalized}: {e}")
         candles_available = 0
